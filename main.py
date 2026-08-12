@@ -421,6 +421,37 @@ class PixivNowPlugin(Star):
         self._schedule_cleanup(p)
         return p
 
+    async def _make_rank_card(
+        self,
+        items: list[dict],
+        *,
+        mode: str,
+        content: str,
+        page: int,
+        date: str,
+    ) -> Path:
+        """下载排行榜缩略图并渲染为单张主题海报。"""
+        thumbs = await asyncio.gather(*(self._fetch_thumb_bytes(item) for item in items))
+        theme = str(self.config.get("render_theme", "dark") or "dark").lower()
+        font_path = str(self.config.get("render_font_path", "") or "").strip()
+        renderer = PixivGridRenderer(theme=theme, font_path=font_path or None)
+        canvas = await asyncio.to_thread(
+            renderer.render_ranking,
+            items,
+            thumbs,
+            mode,
+            content,
+            page,
+            date,
+        )
+        fd, path = tempfile.mkstemp(suffix=".png")
+        with os.fdopen(fd, "wb") as file:
+            canvas.save(file, format="PNG", optimize=True)
+        result = Path(path)
+        self._temp_files.append(result)
+        self._schedule_cleanup(result)
+        return result
+
     # ── 命令组 ────────────────────────────────────────────────────
 
     @filter.command_group("pixiv", alias={"pix"})
@@ -523,19 +554,24 @@ class PixivNowPlugin(Star):
 
         date = data.get("date_range_text") or data.get("date") or ""
         items = data["contents"][:5]
-        yield event.plain_result(
-            f"Pixiv 排行榜（{mode} · {content}）{date}\n"
-            + "\n".join(
-                f"{i['rank']}. {i['title']} - {i.get('user_name', '')} (ID:{i['illust_id']})"
-                for i in items
+        try:
+            card = await self._make_rank_card(
+                items,
+                mode=mode,
+                content=content,
+                page=max(p, 1),
+                date=str(date),
             )
-        )
-        for item in items:
-            try:
-                img = await self._download_best(item)
-                yield event.chain_result([Image.fromFileSystem(str(img))])
-            except PixivNowError as e:
-                logger.error(f"PixivNow rank 图片发送失败: {e}")
+            yield event.chain_result([Image.fromFileSystem(str(card))])
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"PixivNow rank 排行榜渲染失败: {e}")
+            yield event.plain_result(
+                f"Pixiv 排行榜（{mode} · {content}）{date}\n"
+                + "\n".join(
+                    f"{i['rank']}. {i['title']} - {i.get('user_name', '')} (ID:{i['illust_id']})"
+                    for i in items
+                )
+            )
 
     async def _do_search(
         self, keyword: str, page: int = 1, mode: str = "safe"

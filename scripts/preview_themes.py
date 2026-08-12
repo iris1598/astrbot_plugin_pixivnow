@@ -53,6 +53,26 @@ def main() -> None:
         path = out_dir / f"search-grid-{theme}.png"
         image.save(path, "PNG", optimize=True)
         print(path)
+        ranking_items = [
+            {
+                "rank": i + 1,
+                "illust_id": str(125920001 + i),
+                "title": titles[i],
+                "user_name": artists[i],
+            }
+            for i in range(5)
+        ]
+        ranking = PixivGridRenderer(theme=theme).render_ranking(
+            ranking_items,
+            thumbs[:5],
+            "daily",
+            "illust",
+            1,
+            "2026年8月12日",
+        )
+        rank_path = out_dir / f"ranking-{theme}.png"
+        ranking.save(rank_path, "PNG", optimize=True)
+        print(rank_path)
 
 
 if __name__ == "__main__":

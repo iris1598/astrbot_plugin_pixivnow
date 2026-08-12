@@ -355,3 +355,129 @@ class PixivGridRenderer:
         draw.ellipse((width - outer_pad - brand_w - 47, footer_y + 23, width - outer_pad - brand_w - 37, footer_y + 33), fill=(*ACCENT, 255))
         draw.text((width - outer_pad - brand_w - 25, footer_y + 18), brand, font=meta_font, fill=theme.text_tertiary)
         return canvas.convert("RGB")
+
+    def render_ranking(
+        self,
+        items: list[dict],
+        thumbs: list[bytes | None],
+        mode: str = "daily",
+        content: str = "all",
+        page: int = 1,
+        date: str = "",
+    ) -> Image.Image:
+        """渲染 Pixiv 排行榜海报：前三名主卡 + 其余横向榜单。"""
+        theme = self.theme
+        width, pad, gap = 1080, 36, 18
+        hero_w = (width - pad * 2 - gap * 2) // 3
+        hero_media_h, hero_info_h = 300, 116
+        hero_h = hero_media_h + hero_info_h
+        row_h = 156
+        remaining = max(0, len(items) - 3)
+        header_h = 178
+        footer_h = 78
+        height = header_h + pad + hero_h + (gap if remaining else 0) + remaining * (row_h + gap) + pad + footer_h
+
+        canvas = self._gradient((width, height), theme.gradient_top, theme.gradient_bottom)
+        canvas.alpha_composite(self._radial_glow((width, height), (145, 65), ACCENT, theme.glow_alpha))
+        draw = ImageDraw.Draw(canvas)
+
+        title_font = self._font(38, bold=True)
+        eyebrow_font = self._font(18, bold=True)
+        meta_font = self._font(18)
+        chip_font = self._font(17, bold=True)
+        hero_title_font = self._font(21, bold=True)
+        author_font = self._font(17)
+        rank_font = self._font(24, bold=True)
+        row_title_font = self._font(23, bold=True)
+
+        draw.rounded_rectangle((pad, 30, pad + 68, 36), 3, fill=(*ACCENT, 230))
+        draw.text((pad, 54), "PIXIV RANKING", font=eyebrow_font, fill=ACCENT)
+        draw.text((pad, 84), "插画排行榜", font=title_font, fill=theme.text_primary)
+        sub = date.strip() or "实时榜单"
+        draw.text((pad, 137), sub, font=meta_font, fill=theme.text_tertiary)
+
+        chips = [mode.upper(), content.upper(), f"第 {page} 页"]
+        chip_x = width - pad
+        for label in reversed(chips):
+            chip_w = round(chip_font.getlength(label)) + 30
+            chip_x -= chip_w
+            draw.rounded_rectangle((chip_x, 78, chip_x + chip_w, 116), 19, fill=theme.pill_fill, outline=theme.card_border)
+            draw.text((chip_x + 15, 86), label, font=chip_font, fill=theme.text_secondary)
+            chip_x -= 10
+
+        medal_colors = ((255, 190, 54), (174, 185, 205), (203, 132, 78))
+        top = items[:3]
+        for index, item in enumerate(top):
+            x = pad + index * (hero_w + gap)
+            y = header_h + pad
+            shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+            ImageDraw.Draw(shadow).rounded_rectangle((x + 2, y + 7, x + hero_w - 2, y + hero_h + 7), 24, fill=(0, 0, 0, theme.shadow_alpha))
+            canvas.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(13)))
+            draw = ImageDraw.Draw(canvas)
+            draw.rounded_rectangle((x, y, x + hero_w, y + hero_h), 24, fill=theme.card_fill, outline=theme.card_border)
+
+            raw = thumbs[index] if index < len(thumbs) else None
+            try:
+                media = self._rounded_image(Image.open(io.BytesIO(raw)), (hero_w, hero_media_h), 24) if raw else self._placeholder((hero_w, hero_media_h))
+            except Exception:
+                media = self._placeholder((hero_w, hero_media_h))
+            canvas.alpha_composite(media, (x, y))
+
+            overlay = Image.new("RGBA", (hero_w, 82), (0, 0, 0, 0))
+            od = ImageDraw.Draw(overlay)
+            for oy in range(82):
+                od.line((0, oy, hero_w, oy), fill=(0, 0, 0, round(120 * (oy / 81) ** 1.7)))
+            canvas.alpha_composite(overlay, (x, y + hero_media_h - 82))
+
+            rank = str(item.get("rank") or index + 1)
+            medal = medal_colors[index]
+            draw = ImageDraw.Draw(canvas)
+            draw.ellipse((x + 16, y + 16, x + 68, y + 68), fill=(*medal, 248), outline=(255, 255, 255, 120), width=1)
+            rank_box = draw.textbbox((0, 0), rank, font=rank_font)
+            draw.text((x + 42 - (rank_box[2] - rank_box[0]) / 2, y + 42 - (rank_box[3] - rank_box[1]) / 2 - rank_box[1]), rank, font=rank_font, fill=(255, 255, 255))
+
+            title = self._fit_line(item.get("title") or "无标题", hero_title_font, hero_w - 32)
+            author = self._fit_line("@" + str(item.get("user_name") or item.get("userName") or "未知画师"), author_font, hero_w - 32)
+            draw.text((x + 16, y + hero_media_h + 17), title, font=hero_title_font, fill=theme.text_primary)
+            draw.text((x + 16, y + hero_media_h + 56), author, font=author_font, fill=theme.text_secondary)
+            work_id = str(item.get("illust_id") or item.get("id") or "")
+            if work_id:
+                id_text = f"ID {work_id}"
+                draw.text((x + hero_w - 16 - author_font.getlength(id_text), y + hero_media_h + 56), id_text, font=author_font, fill=theme.text_tertiary)
+
+        list_y = header_h + pad + hero_h + gap
+        for offset, item in enumerate(items[3:]):
+            index = offset + 3
+            y = list_y + offset * (row_h + gap)
+            draw = ImageDraw.Draw(canvas)
+            draw.rounded_rectangle((pad, y, width - pad, y + row_h), 22, fill=theme.card_fill, outline=theme.card_border)
+            thumb_w = 210
+            raw = thumbs[index] if index < len(thumbs) else None
+            try:
+                media = self._rounded_image(Image.open(io.BytesIO(raw)), (thumb_w, row_h), 22) if raw else self._placeholder((thumb_w, row_h))
+            except Exception:
+                media = self._placeholder((thumb_w, row_h))
+            canvas.alpha_composite(media, (pad, y))
+
+            rank = str(item.get("rank") or index + 1)
+            rank_x = pad + thumb_w + 28
+            draw = ImageDraw.Draw(canvas)
+            draw.text((rank_x, y + 35), f"#{rank}", font=rank_font, fill=ACCENT)
+            text_x = rank_x + 76
+            max_text_w = width - pad - text_x - 28
+            title = self._fit_line(item.get("title") or "无标题", row_title_font, max_text_w)
+            author = self._fit_line("@" + str(item.get("user_name") or item.get("userName") or "未知画师"), author_font, max_text_w)
+            draw.text((text_x, y + 30), title, font=row_title_font, fill=theme.text_primary)
+            draw.text((text_x, y + 77), author, font=author_font, fill=theme.text_secondary)
+            work_id = str(item.get("illust_id") or item.get("id") or "")
+            draw.text((text_x, y + 108), f"作品 ID  {work_id}", font=author_font, fill=theme.text_tertiary)
+
+        footer_y = height - footer_h
+        draw = ImageDraw.Draw(canvas)
+        draw.rounded_rectangle((pad, footer_y, width - pad, height - 24), 22, fill=theme.footer_fill, outline=theme.card_border)
+        draw.text((pad + 24, footer_y + 18), "Pixiv 官方排行榜 · 图片由 PixivNow 代理获取", font=meta_font, fill=theme.text_secondary)
+        brand = "PixivNow"
+        brand_w = meta_font.getlength(brand)
+        draw.ellipse((width - pad - brand_w - 47, footer_y + 23, width - pad - brand_w - 37, footer_y + 33), fill=(*ACCENT, 255))
+        draw.text((width - pad - brand_w - 25, footer_y + 18), brand, font=meta_font, fill=theme.text_tertiary)
+        return canvas.convert("RGB")

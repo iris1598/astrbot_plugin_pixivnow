@@ -1,0 +1,49 @@
+{
+  "pixivnow_url": {
+    "description": "PixivNow 服务地址（不含末尾斜杠），例如 http://localhost:3000 或 https://pixivnow.example.com",
+    "type": "string",
+    "default": "https://pixiv.js.org"
+  },
+  "token": {
+    "description": "Pixiv 登录 Cookie PHPSESSID（可选）。用于排行榜、R18 模式、登录用户相关功能。留空则匿名访问。",
+    "hint": "浏览器登录 pixiv.net 后从 Cookie 中复制 PHPSESSID；敏感信息，注意保护。",
+    "type": "string",
+    "default": ""
+  },
+  "access_key": {
+    "description": "PixivNow 私有部署访问密钥（作为 X-Access-Key 请求头发送）。仅在自建实例开启访问控制时需要，留空则不发送。",
+    "hint": "与 EdgeOne 环境变量 ACCESS_KEY 保持一致；不了解可留空。",
+    "type": "string",
+    "default": ""
+  },
+  "default_mode": {
+    "description": "默认内容模式",
+    "type": "string",
+    "default": "safe",
+    "options": [
+      "safe",
+      "all",
+      "r18"
+    ]
+  },
+  "default_count": {
+    "description": "随机插画默认张数",
+    "type": "int",
+    "default": 1
+  },
+  "r18_enabled": {
+    "description": "是否允许使用 R18 模式（需配置 token 且 Pixiv 账号设置允许）",
+    "type": "bool",
+    "default": false
+  },
+  "download_timeout": {
+    "description": "图片下载超时时间（秒）",
+    "type": "int",
+    "default": 20
+  },
+  "max_pages": {
+    "description": "多页画作最多发送的页数上限（避免刷屏）",
+    "type": "int",
+    "default": 5
+  }
+}

@@ -69,6 +69,12 @@ class PixivNowPlugin(Star):
         except Exception:
             return False
 
+    @staticmethod
+    def _consume_event(event: AstrMessageEvent) -> None:
+        """消费插件指令：禁止默认 LLM 调用并终止后续事件传播。"""
+        event.should_call_llm(False)
+        event.stop_event()
+
     # ── 基础工具 ──────────────────────────────────────────────────
 
     def _base_url(self) -> str:
@@ -559,6 +565,7 @@ class PixivNowPlugin(Star):
     @pixiv.command("help")
     async def pixiv_help(self, event: AstrMessageEvent):
         """显示帮助信息。"""
+        self._consume_event(event)
         yield event.plain_result(
             "PixivNow 插件使用说明\n"
             "/pixiv random [n] [mode]  随机插画\n"
@@ -588,6 +595,7 @@ class PixivNowPlugin(Star):
             n(int): 张数，0 表示使用默认。
             mode(string): safe/all/r18。
         """
+        self._consume_event(event)
         count = n if n and n > 0 else int(self.config.get("default_count", 1) or 1)
         count = min(max(count, 1), 10)
         mode = mode or str(self.config.get("default_mode", "safe") or "safe")
@@ -632,6 +640,7 @@ class PixivNowPlugin(Star):
             content(string): all/illust/ugoira/manga。
             p(int): 页码。
         """
+        self._consume_event(event)
         try:
             data = await self._request(
                 "/ranking.php",
@@ -750,6 +759,7 @@ class PixivNowPlugin(Star):
             p(int): 页码。
             mode(string): safe/all/r18。
         """
+        self._consume_event(event)
         if not keyword:
             yield event.plain_result("用法：/pixiv search <关键词> [页码] [mode]")
             return
@@ -776,6 +786,7 @@ class PixivNowPlugin(Star):
 
         # 退出
         if msg.lower() in ("e", "exit", "quit", "0"):
+            self._consume_event(event)
             self._search_sessions.pop(umo, None)
             yield event.plain_result("已退出搜索会话。")
             return
@@ -783,6 +794,7 @@ class PixivNowPlugin(Star):
         # 跳页：P<数字>（如 P3 / p12）
         m = re.match(r"^[Pp](\d+)$", msg)
         if m:
+            self._consume_event(event)
             target = max(int(m.group(1)), 1)
             session["ts"] = asyncio.get_event_loop().time()
             async for r in self._show_search_page(
@@ -793,6 +805,7 @@ class PixivNowPlugin(Star):
 
         # 翻页
         if msg.lower() in ("n", "next"):
+            self._consume_event(event)
             target = session.get("page", 1) + 1
             session["ts"] = asyncio.get_event_loop().time()
             async for r in self._show_search_page(
@@ -801,6 +814,7 @@ class PixivNowPlugin(Star):
                 yield r
             return
         if msg.lower() in ("p", "prev", "previous"):
+            self._consume_event(event)
             target = max(session.get("page", 1) - 1, 1)
             session["ts"] = asyncio.get_event_loop().time()
             async for r in self._show_search_page(
@@ -812,6 +826,7 @@ class PixivNowPlugin(Star):
         # 选图下载原图
         if not msg.isdigit():
             return
+        self._consume_event(event)
         idx = int(msg) - 1
         works = session.get("works") or []
         if idx < 0 or idx >= len(works):
@@ -838,6 +853,7 @@ class PixivNowPlugin(Star):
         Args:
             id(string): 画作 ID。
         """
+        self._consume_event(event)
         if not id or not id.isdigit():
             yield event.plain_result("用法：/pixiv illust <画作ID>")
             return
@@ -902,6 +918,7 @@ class PixivNowPlugin(Star):
         Args:
             id(string): 画师用户 ID。
         """
+        self._consume_event(event)
         if not id or not id.isdigit():
             yield event.plain_result("用法：/pixiv user <画师ID>")
             return
@@ -937,6 +954,7 @@ class PixivNowPlugin(Star):
         Args:
             id(string): 小说 ID。
         """
+        self._consume_event(event)
         if not id or not id.isdigit():
             yield event.plain_result("用法：/pixiv novel <小说ID>")
             return
@@ -976,6 +994,7 @@ class PixivNowPlugin(Star):
         Args:
             url(string): 新的 PixivNow 服务地址。
         """
+        self._consume_event(event)
         if not url or not url.startswith(("http://", "https://")):
             yield event.plain_result("地址需以 http:// 或 https:// 开头。")
             return
@@ -991,6 +1010,7 @@ class PixivNowPlugin(Star):
         Args:
             token(string): Pixiv 登录 Cookie PHPSESSID。
         """
+        self._consume_event(event)
         if not token:
             yield event.plain_result("用法：/pixiv settoken <PHPSESSID>")
             return

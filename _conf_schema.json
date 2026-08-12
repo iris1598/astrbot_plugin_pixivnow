@@ -55,6 +55,12 @@
     ],
     "hint": "采用与 rika_share 相同的柔和渐变、品牌色光晕和磨砂卡片视觉语言。"
   },
+  "render_font_path": {
+    "description": "搜索结果图片字体路径（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "通常留空即可自动探测。Docker/Linux 若中文显示方框或字号异常，请填写容器内的中文字体文件或目录，例如 /usr/share/fonts/opentype/noto-cjk/NotoSansCJK-Regular.ttc。"
+  },
   "max_pages": {
     "description": "多页画作最多发送的页数上限（避免刷屏）",
     "type": "int",

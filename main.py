@@ -403,7 +403,12 @@ class PixivNowPlugin(Star):
             *(self._fetch_thumb_bytes(it) for it in items)
         )
         theme = str(self.config.get("render_theme", "dark") or "dark").lower()
-        renderer = PixivGridRenderer(theme=theme, columns=columns)
+        font_path = str(self.config.get("render_font_path", "") or "").strip()
+        renderer = PixivGridRenderer(
+            theme=theme,
+            columns=columns,
+            font_path=font_path or None,
+        )
         canvas = await asyncio.to_thread(
             renderer.render, items, thumbs_data, keyword, page, mode
         )

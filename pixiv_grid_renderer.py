@@ -7,13 +7,119 @@
 from __future__ import annotations
 
 import io
+import logging
 import math
+import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 
 ACCENT = (0, 150, 250)
+logger = logging.getLogger(__name__)
+
+_FONT_CANDIDATES = {
+    "win32": (
+        ("msyh.ttc", "msyhbd.ttc"),
+        ("simhei.ttf", "msyhbd.ttc"),
+        ("Deng.ttf", "Dengb.ttf"),
+        ("simsun.ttc", "simsun.ttc"),
+        ("NotoSansCJK-Regular.ttc", "NotoSansCJK-Bold.ttc"),
+    ),
+    "darwin": (
+        ("PingFang.ttc", "PingFang.ttc"),
+        ("Hiragino Sans GB.ttc", "Hiragino Sans GB.ttc"),
+        ("STHeiti Medium.ttc", "STHeiti Medium.ttc"),
+    ),
+    "linux": (
+        ("NotoSansCJK-Regular.ttc", "NotoSansCJK-Bold.ttc"),
+        ("NotoSansCJKsc-Regular.otf", "NotoSansCJKsc-Bold.otf"),
+        ("NotoSansSC-Regular.ttf", "NotoSansSC-Bold.ttf"),
+        ("SourceHanSansSC-Regular.otf", "SourceHanSansSC-Bold.otf"),
+        ("wqy-zenhei.ttc", "wqy-zenhei.ttc"),
+        ("wqy-microhei.ttc", "wqy-microhei.ttc"),
+        ("DroidSansFallbackFull.ttf", "DroidSansFallbackFull.ttf"),
+    ),
+}
+
+_FONT_DIRS = (
+    Path(__file__).resolve().parent / "assets" / "fonts",
+    Path("C:/Windows/Fonts"),
+    Path("/System/Library/Fonts"),
+    Path("/System/Library/Fonts/Supplemental"),
+    Path("/usr/share/fonts/opentype/noto"),
+    Path("/usr/share/fonts/opentype/noto-cjk"),
+    Path("/usr/share/fonts/truetype/noto-cjk"),
+    Path("/usr/share/fonts/noto-cjk"),
+    Path("/usr/share/fonts/truetype/wqy"),
+    Path("/usr/share/fonts/truetype/droid"),
+    Path("/usr/share/fonts/truetype/arphic"),
+    Path("/usr/share/fonts/opentype/source-han-sans"),
+    Path("/usr/share/fonts/truetype/noto"),
+    Path("/usr/share/fonts"),
+    Path("/usr/local/share/fonts"),
+)
+
+
+def _discover_fonts(custom_path: str | None = None) -> tuple[str | None, str | None]:
+    """跨平台查找中日韩字体，返回常规与粗体字体路径。"""
+    if custom_path:
+        custom = Path(custom_path).expanduser()
+        if custom.is_file():
+            return str(custom), str(custom)
+        if custom.is_dir():
+            found = sorted(
+                p for p in custom.rglob("*")
+                if p.is_file() and p.suffix.lower() in {".ttf", ".ttc", ".otf"}
+            )
+            if found:
+                bold = next((p for p in found if "bold" in p.name.lower()), found[0])
+                regular = next((p for p in found if "regular" in p.name.lower()), found[0])
+                return str(regular), str(bold)
+        logger.warning("PixivNow 渲染字体路径无效，将自动探测系统字体: %s", custom_path)
+
+    platform = sys.platform if sys.platform in _FONT_CANDIDATES else "linux"
+    for regular_name, bold_name in _FONT_CANDIDATES[platform]:
+        for directory in _FONT_DIRS:
+            regular = directory / regular_name
+            bold = directory / bold_name
+            if regular.is_file():
+                return str(regular), str(bold) if bold.is_file() else None
+
+    if platform == "linux":
+        def fontconfig(pattern: str) -> str | None:
+            try:
+                result = subprocess.run(
+                    ["fc-match", "-f", "%{file}\n", pattern],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            path = Path(result.stdout.splitlines()[0].strip()) if result.stdout.strip() else None
+            return str(path) if path and path.is_file() else None
+
+        regular = fontconfig(":lang=zh-cn") or fontconfig("sans-serif:lang=zh-cn")
+        bold = fontconfig(":lang=zh-cn:style=Bold") or regular
+        if regular:
+            return regular, bold
+
+    # 常见字体包的目录层级会随 Linux 发行版变化，最后做一次浅范围递归兜底。
+    for directory in _FONT_DIRS:
+        if not directory.is_dir():
+            continue
+        found = sorted(
+            p for p in directory.rglob("*")
+            if p.is_file() and p.suffix.lower() in {".ttf", ".ttc", ".otf"}
+        )
+        if found:
+            bold = next((p for p in found if "bold" in p.name.lower()), None)
+            return str(found[0]), str(bold) if bold else None
+    return None, None
 
 
 @dataclass(frozen=True)
@@ -70,24 +176,37 @@ THEMES = {
 class PixivGridRenderer:
     """渲染 3×3 Pixiv 搜索结果卡片。"""
 
-    def __init__(self, theme: str = "dark", columns: int = 3):
+    def __init__(
+        self,
+        theme: str = "dark",
+        columns: int = 3,
+        font_path: str | None = None,
+    ):
         self.theme_name = theme if theme in THEMES else "dark"
         self.theme = THEMES[self.theme_name]
         self.columns = max(1, columns)
+        self._regular_font, self._bold_font = _discover_fonts(font_path)
+        self._font_cache: dict[tuple[int, bool], ImageFont.ImageFont] = {}
+        if not self._regular_font:
+            logger.warning(
+                "未找到支持中文的渲染字体，PixivNow 搜索图文字可能变小或显示方框；"
+                "请在 render_font_path 中指定字体文件或目录"
+            )
 
-    @staticmethod
-    def _font(size: int, bold: bool = False) -> ImageFont.ImageFont:
-        names = (
-            ("msyhbd.ttc", "Microsoft YaHei Bold.ttf", "simhei.ttf")
-            if bold
-            else ("msyh.ttc", "Microsoft YaHei.ttf", "Deng.ttf", "simhei.ttf")
-        )
-        for name in names:
+    def _font(self, size: int, bold: bool = False) -> ImageFont.ImageFont:
+        key = (size, bold)
+        if key in self._font_cache:
+            return self._font_cache[key]
+        path = self._bold_font if bold and self._bold_font else self._regular_font
+        if path:
             try:
-                return ImageFont.truetype(name, size)
+                font = ImageFont.truetype(path, size)
             except OSError:
-                continue
-        return ImageFont.load_default()
+                font = ImageFont.load_default()
+        else:
+            font = ImageFont.load_default()
+        self._font_cache[key] = font
+        return font
 
     @staticmethod
     def _gradient(size, top, bottom):

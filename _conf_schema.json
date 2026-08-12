@@ -177,20 +177,20 @@
   },
   "额外设置": {
     "type": "object",
-    "description": "图片自动撤回等额外功能",
+    "description": "消息自动撤回等额外功能",
     "items": {
-      "auto_withdraw_enabled": {
-        "description": "启用图片自动撤回",
+      "auto_recall_enabled": {
+        "description": "自动撤回插件发送的消息",
         "type": "bool",
         "default": false,
-        "hint": "开启后本插件发送的所有图片都会在设定时间后自动撤回；当前仅 OneBot v11（aiocqhttp）平台支持，其他平台自动忽略",
+        "hint": "开启后，本插件发送的消息会在设定时间后自动撤回；仅 OneBot v11 平台生效，群消息撤回需要机器人拥有管理员权限",
         "obvious_hint": true
       },
-      "auto_withdraw_seconds": {
-        "description": "自动撤回延时（秒）",
+      "auto_recall_delay": {
+        "description": "撤回延迟（秒）",
         "type": "int",
         "default": 60,
-        "hint": "图片发送后多少秒自动撤回；范围 5-3600",
+        "hint": "消息发送后经过该时长自动撤回；范围 3-3600",
         "obvious_hint": false
       }
     }

@@ -37,6 +37,12 @@
     "default": 3,
     "hint": "会从前 N 页搜索结果中去重后随机抽取，范围会限制在 1-10 页。页数越大，随机候选越丰富，但请求耗时也会增加。"
   },
+  "fetch_detailed_metadata": {
+    "description": "搜索选图和关键词随机时补查完整作品信息",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭可显著减少详情 API 请求，并仍显示搜索结果已有的标题、画师、ID和链接；开启后会按需补查收藏、喜欢和标签。"
+  },
   "r18_enabled": {
     "description": "是否允许使用 R18 模式（需配置 token 且 Pixiv 账号设置允许）",
     "type": "bool",
@@ -47,8 +53,44 @@
     "type": "int",
     "default": 20
   },
+  "max_concurrent_requests": {
+    "description": "最大并发网络请求数",
+    "type": "int",
+    "default": 6,
+    "hint": "限制 API 和图片下载并发，范围 1-16。服务器配置较低时建议设置为 3-4。"
+  },
+  "http_keepalive_enabled": {
+    "description": "启用 HTTP 空闲连接复用",
+    "type": "bool",
+    "default": false,
+    "hint": "EdgeOne/Serverless 部署建议保持关闭。自建常驻 PixivNow 服务时可开启，空闲连接最多保留约 10 秒；插件不会依赖连接长期存在。"
+  },
+  "api_cache_ttl": {
+    "description": "API 响应缓存时间（秒）",
+    "type": "int",
+    "default": 180,
+    "hint": "相同搜索页、排行榜和详情在缓存期内不重复访问 PixivNow。设为 0 可关闭。"
+  },
+  "image_cache_ttl": {
+    "description": "图片缓存时间（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "短时间重复选图或翻页时复用缩略图和原图。设为 0 可关闭。"
+  },
+  "render_cache_ttl": {
+    "description": "渲染图片缓存时间（秒）",
+    "type": "int",
+    "default": 180,
+    "hint": "翻回相同搜索页或重复查看排行榜时直接复用已渲染图片。设为 0 可关闭。"
+  },
+  "max_memory_image_mb": {
+    "description": "允许放入内存缓存的单张图片上限（MB）",
+    "type": "int",
+    "default": 6,
+    "hint": "超过上限的原图不会常驻内存，只保留短时文件缓存；范围 0-32，0 表示禁用图片内存缓存。"
+  },
   "render_theme": {
-    "description": "搜索结果图片的渲染主题",
+    "description": "所有信息卡的渲染主题",
     "type": "string",
     "default": "dark",
     "options": [
@@ -62,7 +104,7 @@
     "hint": "采用与 rika_share 相同的柔和渐变、品牌色光晕和磨砂卡片视觉语言。"
   },
   "render_font_path": {
-    "description": "搜索结果图片字体路径（可选）",
+    "description": "信息卡字体路径（可选）",
     "type": "string",
     "default": "",
     "hint": "通常留空即可自动探测。Docker/Linux 若中文显示方框或字号异常，请填写容器内的中文字体文件或目录，例如 /usr/share/fonts/opentype/noto-cjk/NotoSansCJK-Regular.ttc。"

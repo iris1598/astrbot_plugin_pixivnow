@@ -1,8 +1,11 @@
 import asyncio
+import copy
+import hashlib
 import os
 import random
 import re
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -62,6 +65,16 @@ class PixivNowPlugin(Star):
         self._temp_files: list[Path] = []
         # 搜索会话：{会话id: {"works": [...], "created": timestamp}}
         self._search_sessions: dict[str, dict] = {}
+        self._http_client: httpx.AsyncClient | None = None
+        self._request_cache: dict[str, tuple[float, dict | list]] = {}
+        self._byte_cache: dict[str, tuple[float, bytes]] = {}
+        self._path_cache: dict[str, tuple[float, Path]] = {}
+        self._render_cache: dict[str, tuple[float, Path]] = {}
+        self._inflight_requests: dict[str, asyncio.Task] = {}
+        self._inflight_bytes: dict[str, asyncio.Task] = {}
+        self._network_semaphore = asyncio.Semaphore(
+            min(max(int(self.config.get("max_concurrent_requests", 6) or 6), 1), 16)
+        )
 
     @staticmethod
     def _is_onebot(event: AstrMessageEvent) -> bool:
@@ -78,6 +91,65 @@ class PixivNowPlugin(Star):
         event.stop_event()
 
     # ── 基础工具 ──────────────────────────────────────────────────
+
+    def _cache_ttl(self, kind: str) -> int:
+        defaults = {"api": 180, "image": 300, "render": 180}
+        key = {"api": "api_cache_ttl", "image": "image_cache_ttl", "render": "render_cache_ttl"}[kind]
+        return min(max(int(self.config.get(key, defaults[kind]) or defaults[kind]), 0), 3600)
+
+    def _prune_cache(self, cache: dict, max_items: int) -> None:
+        now = time.monotonic()
+        for key, (expires, _) in list(cache.items()):
+            if expires <= now:
+                cache.pop(key, None)
+        if len(cache) > max_items:
+            for key, _ in sorted(cache.items(), key=lambda pair: pair[1][0])[: len(cache) - max_items]:
+                cache.pop(key, None)
+
+    @staticmethod
+    def _cache_get(cache: dict, key: str):
+        value = cache.get(key)
+        if not value:
+            return None
+        expires, data = value
+        if expires <= time.monotonic():
+            cache.pop(key, None)
+            return None
+        return data
+
+    @staticmethod
+    def _cache_put(cache: dict, key: str, value, ttl: int) -> None:
+        if ttl > 0:
+            cache[key] = (time.monotonic() + ttl, value)
+
+    async def _client(self) -> httpx.AsyncClient:
+        if self._http_client is None or self._http_client.is_closed:
+            timeout = max(int(self.config.get("download_timeout", 20) or 20), 5)
+            keepalive = bool(self.config.get("http_keepalive_enabled", False))
+            self._http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout),
+                follow_redirects=True,
+                transport=httpx.AsyncHTTPTransport(retries=1),
+                limits=httpx.Limits(
+                    max_connections=12,
+                    max_keepalive_connections=6 if keepalive else 0,
+                    keepalive_expiry=10.0 if keepalive else 0.0,
+                ),
+                headers=self._headers(),
+            )
+        return self._http_client
+
+    def _clear_runtime_caches(self) -> None:
+        self._request_cache.clear()
+        self._byte_cache.clear()
+        self._path_cache.clear()
+        self._render_cache.clear()
+
+    async def _reset_client(self) -> None:
+        if self._http_client is not None and not self._http_client.is_closed:
+            await self._http_client.aclose()
+        self._http_client = None
+        self._clear_runtime_caches()
 
     def _base_url(self) -> str:
         """返回 PixivNow 服务地址（去除末尾斜杠）。"""
@@ -141,7 +213,7 @@ class PixivNowPlugin(Star):
         """
         urls = item.get("urls") or {}
         order = (
-            ("thumb", "small", "regular", "original")
+            ("thumb", "small", "regular")
             if prefer_thumb
             else ("original", "regular", "small", "thumb")
         )
@@ -185,23 +257,49 @@ class PixivNowPlugin(Star):
                 continue
         raise PixivNowError(f"图片下载失败: {last}")
 
-    async def _request(self, path: str, params: dict | None = None) -> dict | list:
+    async def _request(
+        self,
+        path: str,
+        params: dict | None = None,
+        *,
+        use_cache: bool = True,
+    ) -> dict | list:
         """请求 PixivNow 接口并返回解析后的 JSON。"""
         url = self._base_url() + path
-        try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(15.0), follow_redirects=True
-            ) as client:
-                resp = await client.get(url, params=params, headers=self._headers())
-        except httpx.HTTPError as e:
-            raise PixivNowError(f"请求 PixivNow 失败: {e}") from e
+        param_items = tuple(sorted((str(k), str(v)) for k, v in (params or {}).items()))
+        cache_key = f"GET:{url}:{param_items}"
+        if use_cache:
+            cached = self._cache_get(self._request_cache, cache_key)
+            if cached is not None:
+                return copy.deepcopy(cached)
 
-        if resp.status_code != 200:
-            raise PixivNowError(f"PixivNow 返回 HTTP {resp.status_code}（{url}）")
+        async def fetch():
+            try:
+                async with self._network_semaphore:
+                    resp = await (await self._client()).get(url, params=params)
+            except httpx.HTTPError as e:
+                raise PixivNowError(f"请求 PixivNow 失败: {e}") from e
+            if resp.status_code != 200:
+                raise PixivNowError(f"PixivNow 返回 HTTP {resp.status_code}（{url}）")
+            try:
+                data = resp.json()
+            except ValueError as e:
+                raise PixivNowError("PixivNow 返回的不是有效 JSON") from e
+            if use_cache:
+                self._cache_put(self._request_cache, cache_key, data, self._cache_ttl("api"))
+                self._prune_cache(self._request_cache, 128)
+            return data
+
+        inflight_key = cache_key if use_cache else f"{cache_key}:{time.monotonic_ns()}"
+        task = self._inflight_requests.get(inflight_key)
+        if task is None:
+            task = asyncio.create_task(fetch())
+            self._inflight_requests[inflight_key] = task
         try:
-            return resp.json()
-        except ValueError as e:
-            raise PixivNowError("PixivNow 返回的不是有效 JSON") from e
+            return copy.deepcopy(await task)
+        finally:
+            if self._inflight_requests.get(inflight_key) is task:
+                self._inflight_requests.pop(inflight_key, None)
 
     def _unwrap(self, data: dict | list) -> dict | list:
         """解开 /ajax/* 的标准信封 {error, message, body}。
@@ -234,17 +332,36 @@ class PixivNowPlugin(Star):
             PixivNowError: 下载失败时。
         """
         target = self._resolve_url(url)
-        timeout = int(self.config.get("download_timeout", 20) or 20)
+        cached = self._cache_get(self._byte_cache, target)
+        if cached is not None:
+            return cached
+
+        async def fetch():
+            try:
+                async with self._network_semaphore:
+                    resp = await (await self._client()).get(target)
+            except httpx.HTTPError as e:
+                raise PixivNowError(f"图片下载失败: {e}") from e
+            if resp.status_code != 200:
+                raise PixivNowError(f"图片下载失败 HTTP {resp.status_code}")
+            content = resp.content
+            max_bytes = min(
+                max(int(self.config.get("max_memory_image_mb", 6) or 6), 0), 32
+            ) * 1024 * 1024
+            if max_bytes and len(content) <= max_bytes:
+                self._cache_put(self._byte_cache, target, content, self._cache_ttl("image"))
+                self._prune_cache(self._byte_cache, 64)
+            return content
+
+        task = self._inflight_bytes.get(target)
+        if task is None:
+            task = asyncio.create_task(fetch())
+            self._inflight_bytes[target] = task
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(timeout), follow_redirects=True
-            ) as client:
-                resp = await client.get(target, headers=self._headers())
-        except httpx.HTTPError as e:
-            raise PixivNowError(f"图片下载失败: {e}") from e
-        if resp.status_code != 200:
-            raise PixivNowError(f"图片下载失败 HTTP {resp.status_code}")
-        return resp.content
+            return await task
+        finally:
+            if self._inflight_bytes.get(target) is task:
+                self._inflight_bytes.pop(target, None)
 
     async def _download(self, url: str) -> Path:
         """下载图片到临时文件并返回其路径。
@@ -258,6 +375,10 @@ class PixivNowPlugin(Star):
         Raises:
             PixivNowError: 下载失败时。
         """
+        target = self._resolve_url(url)
+        cached_path = self._cache_get(self._path_cache, target)
+        if cached_path is not None and cached_path.exists():
+            return cached_path
         content = await self._fetch_bytes(url)
         suffix = Path(url.split("?")[0]).suffix or ".jpg"
         fd, path = tempfile.mkstemp(suffix=suffix)
@@ -265,7 +386,10 @@ class PixivNowPlugin(Star):
             f.write(content)
         p = Path(path)
         self._temp_files.append(p)
-        self._schedule_cleanup(p)
+        ttl = max(self._cache_ttl("image"), 120)
+        self._cache_put(self._path_cache, target, p, ttl)
+        self._prune_cache(self._path_cache, 64)
+        self._schedule_cleanup(p, ttl + 30)
         return p
 
     def _schedule_cleanup(self, path: Path, delay: int = 120) -> None:
@@ -293,8 +417,28 @@ class PixivNowPlugin(Star):
             canvas.save(file, format="PNG", optimize=True)
         result = Path(path)
         self._temp_files.append(result)
-        self._schedule_cleanup(result)
+        self._schedule_cleanup(result, max(self._cache_ttl("render"), 120) + 30)
         return result
+
+    @staticmethod
+    def _parse_tail_options(
+        raw: str,
+        *,
+        default_count: int | None = None,
+        default_page: int | None = None,
+        default_mode: str = "safe",
+    ) -> tuple[str, int | None, int | None, str]:
+        """解析“主体文本 [数字] [模式]”，主体可包含空格。"""
+        tokens = str(raw).strip().split()
+        mode = default_mode
+        if tokens and tokens[-1].lower() in ("safe", "all", "r18"):
+            mode = tokens.pop().lower()
+        number: int | None = None
+        if tokens and tokens[-1].isdigit():
+            number = int(tokens.pop())
+        count = number if default_count is not None and number is not None else default_count
+        page = number if default_page is not None and number is not None else default_page
+        return " ".join(tokens).strip(), count, page, mode
 
     async def _send_card_separately(
         self, event: AstrMessageEvent, path: Path
@@ -352,12 +496,21 @@ class PixivNowPlugin(Star):
         kind: str,
         data: dict,
         media_url: str = "",
+        media_bytes: bytes | None = None,
     ) -> Path:
         """下载详情卡媒体并调用对应渲染布局。"""
-        media: bytes | None = None
-        if kind == "illust":
+        detail_id = str(data.get("id") or data.get("userId") or "")
+        render_key = hashlib.sha1(
+            f"detail|{kind}|{detail_id}|{data.get('title') or data.get('name')}|{self.config.get('render_theme')}|{self.config.get('render_font_path')}".encode()
+        ).hexdigest()
+        cached = self._cache_get(self._render_cache, render_key)
+        if cached is not None and cached.exists():
+            return cached
+
+        media: bytes | None = media_bytes
+        if media is None and kind == "illust":
             media = await self._fetch_thumb_bytes(data)
-        elif media_url:
+        elif media is None and media_url:
             try:
                 media = await self._fetch_bytes(media_url)
             except PixivNowError as e:
@@ -369,7 +522,10 @@ class PixivNowPlugin(Star):
             "novel": renderer.render_novel_detail,
         }[kind]
         canvas = await asyncio.to_thread(render_method, data, media)
-        return self._save_canvas(canvas)
+        result = self._save_canvas(canvas)
+        self._cache_put(self._render_cache, render_key, result, self._cache_ttl("render"))
+        self._prune_cache(self._render_cache, 32)
+        return result
 
     def _mode_allowed(self, mode: str) -> bool:
         """校验内容模式是否允许使用。
@@ -503,6 +659,53 @@ class PixivNowPlugin(Star):
         )
         return event.chain_result([nodes])
 
+    def _needs_illust_detail(self, item: dict) -> bool:
+        """仅在配置字段确实缺失时补查完整作品详情。"""
+        if not self.config.get("fetch_detailed_metadata", False):
+            return False
+        fields = self._caption_fields()
+        required = {
+            "bookmark": "bookmarkCount",
+            "like": "likeCount",
+            "tags": "tags",
+        }
+        return any(field in fields and item.get(key) is None for field, key in required.items())
+
+    async def _enrich_illust(self, item: dict) -> dict:
+        if not self._needs_illust_detail(item) or not item.get("id"):
+            return item
+        detail = self._unwrap(await self._request(f"/ajax/illust/{item['id']}?full=1"))
+        return detail if isinstance(detail, dict) else item
+
+    def _artwork_collection_result(
+        self,
+        event: AstrMessageEvent,
+        artworks: list[tuple[dict, Path]],
+        header: str = "",
+    ):
+        """统一发送一组作品；OneBot 多图使用合并转发，减少消息条数。"""
+        if self._is_onebot(event) and len(artworks) > 1:
+            sender_name = event.get_sender_name()
+            sender_id = event.get_sender_id()
+            nodes = Comp.Nodes([])
+            if header:
+                nodes.nodes.append(Comp.Node(uin=sender_id, name=sender_name, content=[Comp.Plain(header)]))
+            for item, path in artworks:
+                content: list = []
+                caption = self._caption(item)
+                if caption:
+                    content.append(Comp.Plain(caption))
+                content.append(Comp.Image.fromFileSystem(str(path)))
+                nodes.nodes.append(Comp.Node(uin=sender_id, name=sender_name, content=content))
+            return event.chain_result([nodes])
+
+        chain: list = []
+        if header and len(artworks) > 1:
+            chain.append(Comp.Plain(header))
+        for item, path in artworks:
+            chain.extend(self._caption_chain(item, path))
+        return event.chain_result(chain)
+
     async def _fetch_thumb_bytes(self, item: dict) -> bytes | None:
         """下载单个作品的缩略图字节，失败返回 None。"""
         for url in self._url_candidates(item, prefer_thumb=True):
@@ -537,6 +740,14 @@ class PixivNowPlugin(Star):
         Raises:
             PixivNowError: 合成失败时。
         """
+        item_ids = ",".join(str(item.get("id") or "") for item in items)
+        render_key = hashlib.sha1(
+            f"grid|{keyword}|{page}|{mode}|{columns}|{item_ids}|{self.config.get('render_theme')}|{self.config.get('render_font_path')}".encode()
+        ).hexdigest()
+        cached = self._cache_get(self._render_cache, render_key)
+        if cached is not None and cached.exists():
+            return cached
+
         # 并发下载所有缩略图
         thumbs_data = await asyncio.gather(
             *(self._fetch_thumb_bytes(it) for it in items)
@@ -557,7 +768,10 @@ class PixivNowPlugin(Star):
             canvas.save(f, format="PNG")
         p = Path(path)
         self._temp_files.append(p)
-        self._schedule_cleanup(p)
+        ttl = max(self._cache_ttl("render"), 120)
+        self._cache_put(self._render_cache, render_key, p, ttl)
+        self._prune_cache(self._render_cache, 32)
+        self._schedule_cleanup(p, ttl + 30)
         return p
 
     async def _make_rank_card(
@@ -570,6 +784,13 @@ class PixivNowPlugin(Star):
         date: str,
     ) -> Path:
         """下载排行榜缩略图并渲染为单张主题海报。"""
+        item_ids = ",".join(str(item.get("illust_id") or item.get("id") or "") for item in items)
+        render_key = hashlib.sha1(
+            f"rank|{mode}|{content}|{page}|{date}|{item_ids}|{self.config.get('render_theme')}|{self.config.get('render_font_path')}".encode()
+        ).hexdigest()
+        cached = self._cache_get(self._render_cache, render_key)
+        if cached is not None and cached.exists():
+            return cached
         thumbs = await asyncio.gather(*(self._fetch_thumb_bytes(item) for item in items))
         renderer = self._renderer()
         canvas = await asyncio.to_thread(
@@ -586,7 +807,10 @@ class PixivNowPlugin(Star):
             canvas.save(file, format="PNG", optimize=True)
         result = Path(path)
         self._temp_files.append(result)
-        self._schedule_cleanup(result)
+        ttl = max(self._cache_ttl("render"), 120)
+        self._cache_put(self._render_cache, render_key, result, ttl)
+        self._prune_cache(self._render_cache, 32)
+        self._schedule_cleanup(result, ttl + 30)
         return result
 
     # ── 命令组 ────────────────────────────────────────────────────
@@ -595,17 +819,21 @@ class PixivNowPlugin(Star):
     def pixiv(self):
         """PixivNow 插画查询命令组。"""
 
-    @pixiv.command("help")
+    @pixiv.command("help", alias={"h"})
     async def pixiv_help(self, event: AstrMessageEvent):
         """显示帮助信息。"""
         self._consume_event(event)
         yield event.plain_result(
-            "PixivNow 插件使用说明\n"
-            "/pixiv random [n] [mode]  随机插画\n"
-            "/pixiv random_keyword <关键词> [n] [mode]  指定关键词随机插画\n"
-            "  别名：/pixiv krandom\n"
-            "/pixiv rank [mode] [content] [p]  排行榜\n"
-            "/pixiv search <关键词> [p] [mode]  搜索插画（结果为 3×3 拼图）\n"
+            "PixivNow 指令\n\n"
+            "发现作品\n"
+            "/pixiv r [数量] [模式]  随机插画\n"
+            "/pixiv rk <关键词> [数量] [模式]  关键词随机\n"
+            "/pixiv s <关键词> [页码] [模式]  搜索并进入选图会话\n"
+            "/pixiv top [模式] [类型] [页码]  排行榜\n\n"
+            "查看详情\n"
+            "/pixiv i <作品ID>  作品详情与原图\n"
+            "/pixiv u <画师ID>  画师资料\n"
+            "/pixiv n <小说ID>  小说摘要\n\n"
             "  搜索后会话内：\n"
             "    1-9  下载对应原图\n"
             "    N    下一页\n"
@@ -613,16 +841,14 @@ class PixivNowPlugin(Star):
             "    P数字 跳转到指定页\n"
             "    E/0  退出搜索会话\n"
             f"  无操作 {SEARCH_SESSION_TTL} 秒自动退出\n"
-            "/pixiv illust <id>  画作详情\n"
-            "/pixiv user <id>  画师主页\n"
-            "/pixiv novel <id>  小说详情\n"
+            "\n完整名称 random / random_keyword / search / rank / illust / user / novel 仍兼容\n"
             "/pixiv seturl <地址>  设置 PixivNow 地址（管理员）\n"
             "/pixiv settoken <token>  设置 Pixiv 登录 token（管理员）\n"
             "mode 可选：safe / all / r18\n"
             "可在管理面板配置回复附带的信息字段（标题/画师/标签/链接等）"
         )
 
-    @pixiv.command("random")
+    @pixiv.command("random", alias={"r"})
     async def pixiv_random(self, event: AstrMessageEvent, n: int = 0, mode: str = ""):
         """随机插画。
 
@@ -642,6 +868,7 @@ class PixivNowPlugin(Star):
             data = await self._request(
                 "/api/illust/random",
                 {"format": "json", "max": count, "mode": mode},
+                use_cache=False,
             )
         except PixivNowError as e:
             yield event.plain_result(str(e))
@@ -652,15 +879,23 @@ class PixivNowPlugin(Star):
             yield event.plain_result("没有获取到插画，可能该模式无可展示内容。")
             return
 
-        for idx, item in enumerate(works[:count], 1):
-            try:
-                img = await self._download_best(item)
-                yield event.chain_result(self._caption_chain(item, img))
-            except PixivNowError as e:
-                logger.error(f"PixivNow random 图片发送失败: {e}")
-                yield event.plain_result(f"第 {idx} 张图片下载失败：{e}")
+        selected = works[:count]
+        downloads = await asyncio.gather(
+            *(self._download_best(item) for item in selected),
+            return_exceptions=True,
+        )
+        ready: list[tuple[dict, Path]] = []
+        for index, (item, result) in enumerate(zip(selected, downloads), 1):
+            if isinstance(result, Path):
+                ready.append((item, result))
+            else:
+                logger.error(f"PixivNow random 第 {index} 张下载失败: {result}")
+        if ready:
+            yield self._artwork_collection_result(event, ready, f"Pixiv 随机插画 · {mode.upper()}")
+        elif downloads:
+            yield event.plain_result("随机插画下载失败，请稍后重试。")
 
-    @pixiv.command("random_keyword", alias={"krandom"})
+    @pixiv.command("random_keyword", alias={"rk", "krandom"})
     async def pixiv_random_keyword(
         self,
         event: AstrMessageEvent,
@@ -700,25 +935,24 @@ class PixivNowPlugin(Star):
             max(int(self.config.get("keyword_random_pages", 3) or 3), 1),
             10,
         )
-        results = await asyncio.gather(
-            *(self._do_search(keyword, page, mode) for page in range(1, page_count + 1)),
-            return_exceptions=True,
-        )
         works: list[dict] = []
         seen: set[str] = set()
         last_error: PixivNowError | None = None
-        for result in results:
-            if isinstance(result, PixivNowError):
-                last_error = result
-                continue
-            if isinstance(result, Exception):
-                logger.warning(f"关键词随机搜索部分页面失败: {result}")
+        # 渐进获取：候选数量足够后立即停止，避免固定扫满所有页面。
+        candidate_target = max(count * 4, 12)
+        for page in range(1, page_count + 1):
+            try:
+                result = await self._do_search(keyword, page, mode)
+            except PixivNowError as e:
+                last_error = e
                 continue
             for work in result:
                 work_id = str(work.get("id") or "")
                 if work_id and work_id not in seen:
                     seen.add(work_id)
                     works.append(work)
+            if len(works) >= candidate_target:
+                break
 
         if not works:
             if last_error:
@@ -728,19 +962,28 @@ class PixivNowPlugin(Star):
             return
 
         selected = random.sample(works, min(count, len(works)))
-        for index, work in enumerate(selected, 1):
-            try:
-                detail = self._unwrap(
-                    await self._request(f"/ajax/illust/{work['id']}?full=1")
-                )
-                item = detail if isinstance(detail, dict) else work
-                img = await self._download_best(item)
-                yield event.chain_result(self._caption_chain(item, img))
-            except PixivNowError as e:
-                logger.error(f"PixivNow 关键词随机第 {index} 张发送失败: {e}")
-                yield event.plain_result(f"第 {index} 张图片下载失败：{e}")
 
-    @pixiv.command("rank")
+        async def prepare(work: dict):
+            item = await self._enrich_illust(work)
+            return item, await self._download_best(item)
+
+        prepared = await asyncio.gather(*(prepare(work) for work in selected), return_exceptions=True)
+        ready: list[tuple[dict, Path]] = []
+        for index, result in enumerate(prepared, 1):
+            if isinstance(result, tuple):
+                ready.append(result)
+            else:
+                logger.error(f"PixivNow 关键词随机第 {index} 张发送失败: {result}")
+        if ready:
+            yield self._artwork_collection_result(
+                event,
+                ready,
+                f"关键词随机 · {keyword} · {mode.upper()}",
+            )
+        else:
+            yield event.plain_result("候选作品下载失败，请稍后重试。")
+
+    @pixiv.command("rank", alias={"top"})
     async def pixiv_rank(
         self,
         event: AstrMessageEvent,
@@ -863,26 +1106,28 @@ class PixivNowPlugin(Star):
         except PixivNowError as e:
             yield event.plain_result(f"结果获取/拼图生成失败：{e}")
 
-    @pixiv.command("search")
+    @pixiv.command("search", alias={"s"})
     async def pixiv_search(
-        self, event: AstrMessageEvent, keyword: str, p: int = 1, mode: str = ""
+        self, event: AstrMessageEvent, query: GreedyStr
     ):
         """搜索插画。
 
         Args:
-            keyword(string): 搜索关键词。
-            p(int): 页码。
-            mode(string): safe/all/r18。
+            query(string): 关键词以及可选页码、模式。
         """
         self._consume_event(event)
+        keyword, _, p, mode = self._parse_tail_options(
+            str(query),
+            default_page=1,
+            default_mode=str(self.config.get("default_mode", "safe") or "safe"),
+        )
         if not keyword:
             yield event.plain_result("用法：/pixiv search <关键词> [页码] [mode]")
             return
-        mode = mode or str(self.config.get("default_mode", "safe") or "safe")
         if not self._mode_allowed(mode):
             yield event.plain_result("R18 模式未启用，或模式参数非法。")
             return
-        async for r in self._show_search_page(event, keyword, max(p, 1), mode):
+        async for r in self._show_search_page(event, keyword, max(p or 1, 1), mode):
             yield r
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -952,16 +1197,13 @@ class PixivNowPlugin(Star):
         work = works[idx]
         session["ts"] = asyncio.get_event_loop().time()
         try:
-            detail = self._unwrap(
-                await self._request(f"/ajax/illust/{work['id']}?full=1")
-            )
-            item = detail if isinstance(detail, dict) else work
+            item = await self._enrich_illust(work)
             img = await self._download_best(item)
             yield self._search_selection_result(event, item, img)
         except PixivNowError as e:
             yield event.plain_result(f"下载失败：{e}")
 
-    @pixiv.command("illust")
+    @pixiv.command("illust", alias={"i"})
     async def pixiv_illust(self, event: AstrMessageEvent, id: str):
         """画作详情（含多页）。
 
@@ -984,49 +1226,47 @@ class PixivNowPlugin(Star):
 
         max_pages = int(self.config.get("max_pages", 5) or 5)
         page_count = int(body.get("pageCount") or 1)
-
+        paths: list[Path] = []
         try:
-            card = await self._make_detail_card(
-                "illust",
-                body,
-            )
+            if page_count > 1:
+                pages = self._unwrap(await self._request(f"/ajax/illust/{id}/pages"))
+                if isinstance(pages, list):
+                    downloads = await asyncio.gather(
+                        *(self._download_best(pg) for pg in pages[:max_pages]),
+                        return_exceptions=True,
+                    )
+                    paths = [result for result in downloads if isinstance(result, Path)]
+            else:
+                paths = [await self._download_best(body)]
+        except PixivNowError as e:
+            logger.warning(f"作品原图下载失败，仍尝试发送信息卡: {e}")
+
+        media_bytes: bytes | None = None
+        if paths:
+            try:
+                media_bytes = await asyncio.to_thread(paths[0].read_bytes)
+            except OSError:
+                pass
+        try:
+            card = await self._make_detail_card("illust", body, media_bytes=media_bytes)
             if not await self._send_card_separately(event, card):
                 yield event.chain_result([Image.fromFileSystem(str(card))])
         except Exception as e:  # noqa: BLE001
             logger.error(f"PixivNow illust 信息卡渲染失败: {e}")
             text = self._caption(body)
             if page_count > 1:
-                text += f"\n共 {page_count} 页，先展示前 {min(page_count, max_pages)} 页"
+                text += f"\n共 {page_count} 页，展示前 {len(paths)} 页"
             if text:
                 yield event.plain_result(text)
 
-        # 多页时优先展示各页
-        if page_count > 1:
-            try:
-                pages = self._unwrap(await self._request(f"/ajax/illust/{id}/pages"))
-                if isinstance(pages, list):
-                    paths: list[Path] = []
-                    for pg in pages[:max_pages]:
-                        try:
-                            paths.append(await self._download_best(pg))
-                        except PixivNowError as e:
-                            logger.error(f"PixivNow illust 分页发送失败: {e}")
-                    header = f"作品原图 · 共 {page_count} 页，展示前 {len(paths)} 页"
-                    async for result in self._send_image_collection(event, paths, header):
-                        yield result
-                    return
-            except PixivNowError as e:
-                logger.error(f"获取分页失败: {e}")
-
-        # 单页：发送主图
-        try:
-            img = await self._download_best(body)
-            async for result in self._send_image_collection(event, [img]):
+        if paths:
+            header = f"作品原图 · 共 {page_count} 页，展示前 {len(paths)} 页" if page_count > 1 else ""
+            async for result in self._send_image_collection(event, paths, header):
                 yield result
-        except PixivNowError as e:
-            yield event.plain_result(str(e))
+        else:
+            yield event.plain_result("作品信息已获取，但原图下载失败。")
 
-    @pixiv.command("user")
+    @pixiv.command("user", alias={"u"})
     async def pixiv_user(self, event: AstrMessageEvent, id: str):
         """画师主页。
 
@@ -1062,7 +1302,7 @@ class PixivNowPlugin(Star):
                 f"主页：https://www.pixiv.net/users/{body.get('userId')}"
             )
 
-    @pixiv.command("novel")
+    @pixiv.command("novel", alias={"n"})
     async def pixiv_novel(self, event: AstrMessageEvent, id: str):
         """小说详情。
 
@@ -1115,6 +1355,7 @@ class PixivNowPlugin(Star):
             return
         self.config["pixivnow_url"] = url.rstrip("/")
         self.config.save_config()
+        await self._reset_client()
         yield event.plain_result(f"已设置 PixivNow 地址为：{url.rstrip('/')}")
 
     @pixiv.command("settoken")
@@ -1131,10 +1372,13 @@ class PixivNowPlugin(Star):
             return
         self.config["token"] = token.strip()
         self.config.save_config()
+        await self._reset_client()
         yield event.plain_result("已设置 Pixiv 登录 token。")
 
     async def terminate(self):
         """插件卸载/停用时清理临时文件。"""
+        if self._http_client is not None and not self._http_client.is_closed:
+            await self._http_client.aclose()
         for p in self._temp_files:
             try:
                 p.unlink(missing_ok=True)

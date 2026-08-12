@@ -46,7 +46,6 @@ CAPTION_FIELD_NAMES: dict[str, str] = {
 # 所有合法字段（与 _conf_schema.json 中 caption_fields 的 options 保持一致）
 ALL_CAPTION_FIELDS: tuple[str, ...] = tuple(CAPTION_FIELD_NAMES)
 
-
 class PixivNowError(Exception):
     """PixivNow/Pixiv 接口调用异常。"""
 
@@ -73,8 +72,24 @@ class PixivNowPlugin(Star):
         self._inflight_requests: dict[str, asyncio.Task] = {}
         self._inflight_bytes: dict[str, asyncio.Task] = {}
         self._network_semaphore = asyncio.Semaphore(
-            min(max(int(self.config.get("max_concurrent_requests", 6) or 6), 1), 16)
+            min(max(int(self._cfg("max_concurrent_requests", 6) or 6), 1), 16)
         )
+
+    def _cfg(self, key: str, default=None):
+        """从新版分组配置读取值。"""
+        for group in ("基础配置", "高级配置"):
+            group_data = self.config.get(group)
+            if isinstance(group_data, dict) and key in group_data:
+                return group_data.get(key, default)
+        return default
+
+    def _set_cfg(self, key: str, value, group: str = "基础配置") -> None:
+        """写入新版分组配置。"""
+        group_data = self.config.get(group)
+        if not isinstance(group_data, dict):
+            group_data = {}
+        group_data[key] = value
+        self.config[group] = group_data
 
     @staticmethod
     def _is_onebot(event: AstrMessageEvent) -> bool:
@@ -95,7 +110,7 @@ class PixivNowPlugin(Star):
     def _cache_ttl(self, kind: str) -> int:
         defaults = {"api": 180, "image": 300, "render": 180}
         key = {"api": "api_cache_ttl", "image": "image_cache_ttl", "render": "render_cache_ttl"}[kind]
-        return min(max(int(self.config.get(key, defaults[kind]) or defaults[kind]), 0), 3600)
+        return min(max(int(self._cfg(key, defaults[kind]) or defaults[kind]), 0), 3600)
 
     def _prune_cache(self, cache: dict, max_items: int) -> None:
         now = time.monotonic()
@@ -124,8 +139,8 @@ class PixivNowPlugin(Star):
 
     async def _client(self) -> httpx.AsyncClient:
         if self._http_client is None or self._http_client.is_closed:
-            timeout = max(int(self.config.get("download_timeout", 20) or 20), 5)
-            keepalive = bool(self.config.get("http_keepalive_enabled", False))
+            timeout = max(int(self._cfg("download_timeout", 20) or 20), 5)
+            keepalive = bool(self._cfg("http_keepalive_enabled", False))
             self._http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(timeout),
                 follow_redirects=True,
@@ -154,7 +169,7 @@ class PixivNowPlugin(Star):
     def _base_url(self) -> str:
         """返回 PixivNow 服务地址（去除末尾斜杠）。"""
         url = str(
-            self.config.get("pixivnow_url", "https://pixiv.js.org") or ""
+            self._cfg("pixivnow_url", "https://pixiv.js.org") or ""
         ).strip()
         if not url:
             raise PixivNowError("未配置 PixivNow 地址，请使用 /pixiv seturl 设置")
@@ -163,10 +178,10 @@ class PixivNowPlugin(Star):
     def _headers(self) -> dict:
         """构造请求头，若配置了 token 则附带 Authorization、access_key 则附带 X-Access-Key。"""
         headers = {"User-Agent": UA}
-        token = str(self.config.get("token", "") or "").strip()
+        token = str(self._cfg("token", "") or "").strip()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        access_key = str(self.config.get("access_key", "") or "").strip()
+        access_key = str(self._cfg("access_key", "") or "").strip()
         if access_key:
             headers["X-Access-Key"] = access_key
         return headers
@@ -346,7 +361,7 @@ class PixivNowPlugin(Star):
                 raise PixivNowError(f"图片下载失败 HTTP {resp.status_code}")
             content = resp.content
             max_bytes = min(
-                max(int(self.config.get("max_memory_image_mb", 6) or 6), 0), 32
+                max(int(self._cfg("max_memory_image_mb", 6) or 6), 0), 32
             ) * 1024 * 1024
             if max_bytes and len(content) <= max_bytes:
                 self._cache_put(self._byte_cache, target, content, self._cache_ttl("image"))
@@ -406,8 +421,8 @@ class PixivNowPlugin(Star):
 
     def _renderer(self) -> PixivGridRenderer:
         """按当前配置创建统一主题渲染器。"""
-        theme = str(self.config.get("render_theme", "dark") or "dark").lower()
-        font_path = str(self.config.get("render_font_path", "") or "").strip()
+        theme = str(self._cfg("render_theme", "dark") or "dark").lower()
+        font_path = str(self._cfg("render_font_path", "") or "").strip()
         return PixivGridRenderer(theme=theme, font_path=font_path or None)
 
     def _save_canvas(self, canvas) -> Path:
@@ -501,7 +516,7 @@ class PixivNowPlugin(Star):
         """下载详情卡媒体并调用对应渲染布局。"""
         detail_id = str(data.get("id") or data.get("userId") or "")
         render_key = hashlib.sha1(
-            f"detail|{kind}|{detail_id}|{data.get('title') or data.get('name')}|{self.config.get('render_theme')}|{self.config.get('render_font_path')}".encode()
+            f"detail|{kind}|{detail_id}|{data.get('title') or data.get('name')}|{self._cfg('render_theme')}|{self._cfg('render_font_path')}".encode()
         ).hexdigest()
         cached = self._cache_get(self._render_cache, render_key)
         if cached is not None and cached.exists():
@@ -536,7 +551,7 @@ class PixivNowPlugin(Star):
         Returns:
             True 表示允许。
         """
-        if mode == "r18" and not self.config.get("r18_enabled", False):
+        if mode == "r18" and not self._cfg("r18_enabled", False):
             return False
         return mode in ("safe", "all", "r18")
 
@@ -546,7 +561,7 @@ class PixivNowPlugin(Star):
         返回配置项 caption_fields 中勾选且合法的字段；若从未配置
         （如旧版插件升级后未保存过配置），则默认展示全部字段。
         """
-        raw = self.config.get("caption_fields")
+        raw = self._cfg("caption_fields")
         if raw is None:
             return list(ALL_CAPTION_FIELDS)
         if not isinstance(raw, list):
@@ -582,7 +597,7 @@ class PixivNowPlugin(Star):
         if "tags" in fields and item.get("tags"):
             tags = self._extract_tags(item["tags"])
             if tags:
-                max_tags = max(int(self.config.get("max_tags", 10) or 10), 1)
+                max_tags = max(int(self._cfg("max_tags", 10) or 10), 1)
                 shown = tags[:max_tags]
                 suffix = f" 等 {len(tags)} 个标签" if len(tags) > max_tags else ""
                 lines.append("标签：" + " ".join(shown) + suffix)
@@ -660,9 +675,7 @@ class PixivNowPlugin(Star):
         return event.chain_result([nodes])
 
     def _needs_illust_detail(self, item: dict) -> bool:
-        """仅在配置字段确实缺失时补查完整作品详情。"""
-        if not self.config.get("fetch_detailed_metadata", False):
-            return False
+        """勾选的信息字段缺失时按需补查详情，字段配置始终优先。"""
         fields = self._caption_fields()
         required = {
             "bookmark": "bookmarkCount",
@@ -742,7 +755,7 @@ class PixivNowPlugin(Star):
         """
         item_ids = ",".join(str(item.get("id") or "") for item in items)
         render_key = hashlib.sha1(
-            f"grid|{keyword}|{page}|{mode}|{columns}|{item_ids}|{self.config.get('render_theme')}|{self.config.get('render_font_path')}".encode()
+            f"grid|{keyword}|{page}|{mode}|{columns}|{item_ids}|{self._cfg('render_theme')}|{self._cfg('render_font_path')}".encode()
         ).hexdigest()
         cached = self._cache_get(self._render_cache, render_key)
         if cached is not None and cached.exists():
@@ -752,8 +765,8 @@ class PixivNowPlugin(Star):
         thumbs_data = await asyncio.gather(
             *(self._fetch_thumb_bytes(it) for it in items)
         )
-        theme = str(self.config.get("render_theme", "dark") or "dark").lower()
-        font_path = str(self.config.get("render_font_path", "") or "").strip()
+        theme = str(self._cfg("render_theme", "dark") or "dark").lower()
+        font_path = str(self._cfg("render_font_path", "") or "").strip()
         renderer = PixivGridRenderer(
             theme=theme,
             columns=columns,
@@ -786,7 +799,7 @@ class PixivNowPlugin(Star):
         """下载排行榜缩略图并渲染为单张主题海报。"""
         item_ids = ",".join(str(item.get("illust_id") or item.get("id") or "") for item in items)
         render_key = hashlib.sha1(
-            f"rank|{mode}|{content}|{page}|{date}|{item_ids}|{self.config.get('render_theme')}|{self.config.get('render_font_path')}".encode()
+            f"rank|{mode}|{content}|{page}|{date}|{item_ids}|{self._cfg('render_theme')}|{self._cfg('render_font_path')}".encode()
         ).hexdigest()
         cached = self._cache_get(self._render_cache, render_key)
         if cached is not None and cached.exists():
@@ -857,9 +870,9 @@ class PixivNowPlugin(Star):
             mode(string): safe/all/r18。
         """
         self._consume_event(event)
-        count = n if n and n > 0 else int(self.config.get("default_count", 1) or 1)
+        count = n if n and n > 0 else int(self._cfg("default_count", 1) or 1)
         count = min(max(count, 1), 10)
-        mode = mode or str(self.config.get("default_mode", "safe") or "safe")
+        mode = mode or str(self._cfg("default_mode", "safe") or "safe")
         if not self._mode_allowed(mode):
             yield event.plain_result("R18 模式未启用，或模式参数非法。")
             return
@@ -880,14 +893,19 @@ class PixivNowPlugin(Star):
             return
 
         selected = works[:count]
+
+        async def prepare_random(item: dict):
+            enriched = await self._enrich_illust(item)
+            return enriched, await self._download_best(enriched)
+
         downloads = await asyncio.gather(
-            *(self._download_best(item) for item in selected),
+            *(prepare_random(item) for item in selected),
             return_exceptions=True,
         )
         ready: list[tuple[dict, Path]] = []
-        for index, (item, result) in enumerate(zip(selected, downloads), 1):
-            if isinstance(result, Path):
-                ready.append((item, result))
+        for index, result in enumerate(downloads, 1):
+            if isinstance(result, tuple):
+                ready.append(result)
             else:
                 logger.error(f"PixivNow random 第 {index} 张下载失败: {result}")
         if ready:
@@ -914,11 +932,11 @@ class PixivNowPlugin(Star):
             )
             return
 
-        mode = str(self.config.get("default_mode", "safe") or "safe")
+        mode = str(self._cfg("default_mode", "safe") or "safe")
         if tokens and tokens[-1].lower() in ("safe", "all", "r18"):
             mode = tokens.pop().lower()
 
-        count = int(self.config.get("default_count", 1) or 1)
+        count = int(self._cfg("default_count", 1) or 1)
         if tokens and tokens[-1].isdigit():
             count = int(tokens.pop())
         count = min(max(count, 1), 10)
@@ -932,7 +950,7 @@ class PixivNowPlugin(Star):
             return
 
         page_count = min(
-            max(int(self.config.get("keyword_random_pages", 3) or 3), 1),
+            max(int(self._cfg("keyword_random_pages", 3) or 3), 1),
             10,
         )
         works: list[dict] = []
@@ -1119,7 +1137,7 @@ class PixivNowPlugin(Star):
         keyword, _, p, mode = self._parse_tail_options(
             str(query),
             default_page=1,
-            default_mode=str(self.config.get("default_mode", "safe") or "safe"),
+            default_mode=str(self._cfg("default_mode", "safe") or "safe"),
         )
         if not keyword:
             yield event.plain_result("用法：/pixiv search <关键词> [页码] [mode]")
@@ -1224,7 +1242,6 @@ class PixivNowPlugin(Star):
             yield event.plain_result("未找到该画作。")
             return
 
-        max_pages = int(self.config.get("max_pages", 5) or 5)
         page_count = int(body.get("pageCount") or 1)
         paths: list[Path] = []
         try:
@@ -1232,7 +1249,7 @@ class PixivNowPlugin(Star):
                 pages = self._unwrap(await self._request(f"/ajax/illust/{id}/pages"))
                 if isinstance(pages, list):
                     downloads = await asyncio.gather(
-                        *(self._download_best(pg) for pg in pages[:max_pages]),
+                        *(self._download_best(pg) for pg in pages),
                         return_exceptions=True,
                     )
                     paths = [result for result in downloads if isinstance(result, Path)]
@@ -1353,7 +1370,7 @@ class PixivNowPlugin(Star):
         if not url or not url.startswith(("http://", "https://")):
             yield event.plain_result("地址需以 http:// 或 https:// 开头。")
             return
-        self.config["pixivnow_url"] = url.rstrip("/")
+        self._set_cfg("pixivnow_url", url.rstrip("/"))
         self.config.save_config()
         await self._reset_client()
         yield event.plain_result(f"已设置 PixivNow 地址为：{url.rstrip('/')}")
@@ -1370,7 +1387,7 @@ class PixivNowPlugin(Star):
         if not token:
             yield event.plain_result("用法：/pixiv settoken <PHPSESSID>")
             return
-        self.config["token"] = token.strip()
+        self._set_cfg("token", token.strip())
         self.config.save_config()
         await self._reset_client()
         yield event.plain_result("已设置 Pixiv 登录 token。")

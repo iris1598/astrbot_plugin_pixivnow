@@ -1,155 +1,141 @@
 {
-  "pixivnow_url": {
-    "description": "PixivNow 服务地址（不含末尾斜杠），例如 http://localhost:3000 或 https://pixivnow.example.com",
-    "type": "string",
-    "default": "https://pixiv.js.org"
+  "基础配置": {
+    "type": "object",
+    "description": "服务连接、默认行为、内容字段与卡片外观",
+    "items": {
+      "pixivnow_url": {
+        "description": "PixivNow 服务地址",
+        "type": "string",
+        "default": "https://pixiv.js.org",
+        "hint": "不含末尾斜杠，例如 https://pixivnow.example.com",
+        "obvious_hint": true
+      },
+      "token": {
+        "description": "Pixiv 登录 Cookie PHPSESSID（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "用于排行榜、R18 和登录用户功能，请注意保护敏感信息",
+        "obvious_hint": true
+      },
+      "access_key": {
+        "description": "私有部署访问密钥（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "作为 X-Access-Key 请求头发送，仅自建实例开启访问控制时需要",
+        "obvious_hint": false
+      },
+      "default_mode": {
+        "description": "默认内容模式",
+        "type": "string",
+        "default": "safe",
+        "options": ["safe", "all", "r18"],
+        "obvious_hint": true
+      },
+      "r18_enabled": {
+        "description": "允许使用 R18 模式",
+        "type": "bool",
+        "default": false,
+        "hint": "需要配置 Token，并确保 Pixiv 账号设置允许",
+        "obvious_hint": true
+      },
+      "default_count": {
+        "description": "随机插画默认张数",
+        "type": "int",
+        "default": 1,
+        "obvious_hint": true
+      },
+      "keyword_random_pages": {
+        "description": "关键词随机最多检查页数",
+        "type": "int",
+        "default": 3,
+        "hint": "候选数量足够后会提前停止，实际不一定访问全部页面；范围 1-10",
+        "obvious_hint": false
+      },
+      "caption_fields": {
+        "description": "作品回复中展示的信息字段",
+        "type": "list",
+        "default": ["title", "artist", "id", "bookmark", "like", "tags", "link"],
+        "options": ["title", "artist", "id", "bookmark", "like", "tags", "link"],
+        "labels": ["标题", "画师", "作品ID", "收藏数", "喜欢数", "标签", "作品链接"],
+        "render_type": "checkbox",
+        "hint": "缺失的已勾选字段会按需补查一次作品详情；未勾选字段不会产生额外请求",
+        "obvious_hint": true
+      },
+      "max_tags": {
+        "description": "最多展示的标签数量",
+        "type": "int",
+        "default": 10,
+        "obvious_hint": false
+      },
+      "render_theme": {
+        "description": "信息卡主题",
+        "type": "string",
+        "default": "dark",
+        "options": ["dark", "light"],
+        "labels": ["暗色", "亮色"],
+        "obvious_hint": true
+      },
+      "render_font_path": {
+        "description": "信息卡字体路径（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "通常留空自动探测；Docker 中文异常时填写字体文件或目录",
+        "obvious_hint": false
+      }
+    }
   },
-  "token": {
-    "description": "Pixiv 登录 Cookie PHPSESSID（可选）。用于排行榜、R18 模式、登录用户相关功能。留空则匿名访问。",
-    "hint": "浏览器登录 pixiv.net 后从 Cookie 中复制 PHPSESSID；敏感信息，注意保护。",
-    "type": "string",
-    "default": ""
-  },
-  "access_key": {
-    "description": "PixivNow 私有部署访问密钥（作为 X-Access-Key 请求头发送）。仅在自建实例开启访问控制时需要，留空则不发送。",
-    "hint": "与 EdgeOne 环境变量 ACCESS_KEY 保持一致；不了解可留空。",
-    "type": "string",
-    "default": ""
-  },
-  "default_mode": {
-    "description": "默认内容模式",
-    "type": "string",
-    "default": "safe",
-    "options": [
-      "safe",
-      "all",
-      "r18"
-    ]
-  },
-  "default_count": {
-    "description": "随机插画默认张数",
-    "type": "int",
-    "default": 1
-  },
-  "keyword_random_pages": {
-    "description": "关键词随机抽取时汇总的搜索页数",
-    "type": "int",
-    "default": 3,
-    "hint": "会从前 N 页搜索结果中去重后随机抽取，范围会限制在 1-10 页。页数越大，随机候选越丰富，但请求耗时也会增加。"
-  },
-  "fetch_detailed_metadata": {
-    "description": "搜索选图和关键词随机时补查完整作品信息",
-    "type": "bool",
-    "default": false,
-    "hint": "关闭可显著减少详情 API 请求，并仍显示搜索结果已有的标题、画师、ID和链接；开启后会按需补查收藏、喜欢和标签。"
-  },
-  "r18_enabled": {
-    "description": "是否允许使用 R18 模式（需配置 token 且 Pixiv 账号设置允许）",
-    "type": "bool",
-    "default": false
-  },
-  "download_timeout": {
-    "description": "图片下载超时时间（秒）",
-    "type": "int",
-    "default": 20
-  },
-  "max_concurrent_requests": {
-    "description": "最大并发网络请求数",
-    "type": "int",
-    "default": 6,
-    "hint": "限制 API 和图片下载并发，范围 1-16。服务器配置较低时建议设置为 3-4。"
-  },
-  "http_keepalive_enabled": {
-    "description": "启用 HTTP 空闲连接复用",
-    "type": "bool",
-    "default": false,
-    "hint": "EdgeOne/Serverless 部署建议保持关闭。自建常驻 PixivNow 服务时可开启，空闲连接最多保留约 10 秒；插件不会依赖连接长期存在。"
-  },
-  "api_cache_ttl": {
-    "description": "API 响应缓存时间（秒）",
-    "type": "int",
-    "default": 180,
-    "hint": "相同搜索页、排行榜和详情在缓存期内不重复访问 PixivNow。设为 0 可关闭。"
-  },
-  "image_cache_ttl": {
-    "description": "图片缓存时间（秒）",
-    "type": "int",
-    "default": 300,
-    "hint": "短时间重复选图或翻页时复用缩略图和原图。设为 0 可关闭。"
-  },
-  "render_cache_ttl": {
-    "description": "渲染图片缓存时间（秒）",
-    "type": "int",
-    "default": 180,
-    "hint": "翻回相同搜索页或重复查看排行榜时直接复用已渲染图片。设为 0 可关闭。"
-  },
-  "max_memory_image_mb": {
-    "description": "允许放入内存缓存的单张图片上限（MB）",
-    "type": "int",
-    "default": 6,
-    "hint": "超过上限的原图不会常驻内存，只保留短时文件缓存；范围 0-32，0 表示禁用图片内存缓存。"
-  },
-  "render_theme": {
-    "description": "所有信息卡的渲染主题",
-    "type": "string",
-    "default": "dark",
-    "options": [
-      "dark",
-      "light"
-    ],
-    "labels": [
-      "暗色",
-      "亮色"
-    ],
-    "hint": "采用与 rika_share 相同的柔和渐变、品牌色光晕和磨砂卡片视觉语言。"
-  },
-  "render_font_path": {
-    "description": "信息卡字体路径（可选）",
-    "type": "string",
-    "default": "",
-    "hint": "通常留空即可自动探测。Docker/Linux 若中文显示方框或字号异常，请填写容器内的中文字体文件或目录，例如 /usr/share/fonts/opentype/noto-cjk/NotoSansCJK-Regular.ttc。"
-  },
-  "max_pages": {
-    "description": "多页画作最多发送的页数上限（避免刷屏）",
-    "type": "int",
-    "default": 5
-  },
-  "caption_fields": {
-    "description": "回复作品时附带的信息字段（勾选需要展示的内容，不勾选则只发图片）",
-    "type": "list",
-    "default": [
-      "title",
-      "artist",
-      "id",
-      "bookmark",
-      "like",
-      "tags",
-      "link"
-    ],
-    "options": [
-      "title",
-      "artist",
-      "id",
-      "bookmark",
-      "like",
-      "tags",
-      "link"
-    ],
-    "labels": [
-      "标题",
-      "画师",
-      "作品ID",
-      "收藏数",
-      "喜欢数",
-      "标签",
-      "作品链接"
-    ],
-    "render_type": "checkbox",
-    "hint": "作用于随机插画、搜索选图与画作详情等回复。title=标题，artist=画师，id=作品ID，bookmark=收藏数，like=喜欢数，tags=标签，link=作品链接。"
-  },
-  "max_tags": {
-    "description": "回复中最多展示的标签数量（超过则省略并提示总数）",
-    "type": "int",
-    "default": 10
+  "高级配置": {
+    "type": "object",
+    "description": "EdgeOne 网络策略、并发限制和缓存参数，通常保持默认即可",
+    "items": {
+      "download_timeout": {
+        "description": "网络请求超时时间（秒）",
+        "type": "int",
+        "default": 20,
+        "obvious_hint": false
+      },
+      "max_concurrent_requests": {
+        "description": "最大并发网络请求数",
+        "type": "int",
+        "default": 6,
+        "hint": "范围 1-16；EdgeOne 压力较大时可降至 3-4",
+        "obvious_hint": false
+      },
+      "http_keepalive_enabled": {
+        "description": "启用 HTTP 空闲连接复用",
+        "type": "bool",
+        "default": false,
+        "hint": "EdgeOne/Serverless 建议关闭；常驻自建服务可开启短时复用",
+        "obvious_hint": false
+      },
+      "api_cache_ttl": {
+        "description": "API 响应缓存时间（秒）",
+        "type": "int",
+        "default": 180,
+        "hint": "设为 0 可关闭",
+        "obvious_hint": false
+      },
+      "image_cache_ttl": {
+        "description": "图片缓存时间（秒）",
+        "type": "int",
+        "default": 300,
+        "hint": "设为 0 可关闭",
+        "obvious_hint": false
+      },
+      "render_cache_ttl": {
+        "description": "渲染图片缓存时间（秒）",
+        "type": "int",
+        "default": 180,
+        "hint": "设为 0 可关闭",
+        "obvious_hint": false
+      },
+      "max_memory_image_mb": {
+        "description": "单张图片内存缓存上限（MB）",
+        "type": "int",
+        "default": 6,
+        "hint": "超过上限的图片只使用临时文件缓存；0 表示禁用内存图片缓存",
+        "obvious_hint": false
+      }
+    }
   }
 }

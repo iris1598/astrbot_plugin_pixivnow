@@ -29,6 +29,19 @@ SIZE_PREFIX_RE = re.compile(r"/c/[^/]+/")
 # 缩略图文件名的质量后缀
 THUMB_SUFFIX_RE = re.compile(r"_(square1200|custom1200)\.(jpg|png|gif)$")
 
+# 回复作品时可通过配置勾选展示的信息字段（key -> 中文名，用于提示）
+CAPTION_FIELD_NAMES: dict[str, str] = {
+    "title": "标题",
+    "artist": "画师",
+    "id": "作品ID",
+    "bookmark": "收藏数",
+    "like": "喜欢数",
+    "tags": "标签",
+    "link": "作品链接",
+}
+# 所有合法字段（与 _conf_schema.json 中 caption_fields 的 options 保持一致）
+ALL_CAPTION_FIELDS: tuple[str, ...] = tuple(CAPTION_FIELD_NAMES)
+
 
 class PixivNowError(Exception):
     """PixivNow/Pixiv 接口调用异常。"""
@@ -265,27 +278,93 @@ class PixivNowPlugin(Star):
             return False
         return mode in ("safe", "all", "r18")
 
+    def _caption_fields(self) -> list[str]:
+        """读取配置，返回回复作品时应展示的信息字段列表。
+
+        返回配置项 caption_fields 中勾选且合法的字段；若从未配置
+        （如旧版插件升级后未保存过配置），则默认展示全部字段。
+        """
+        raw = self.config.get("caption_fields")
+        if raw is None:
+            return list(ALL_CAPTION_FIELDS)
+        if not isinstance(raw, list):
+            return list(ALL_CAPTION_FIELDS)
+        return [f for f in raw if f in ALL_CAPTION_FIELDS]
+
     def _caption(self, item: dict, *, extra: str = "") -> str:
-        """根据作品对象构造文本说明。"""
-        lines = [f"标题：{item.get('title', '未知')}"]
-        if item.get("userName"):
+        """根据配置勾选的字段构造作品文本说明。
+
+        仅展示配置项 caption_fields 中勾选的信息（标题、画师、ID、
+        收藏、喜欢、标签、链接等）；全部取消勾选时返回空字符串，
+        即只发送图片不带文字。
+
+        Args:
+            item: 作品对象。
+            extra: 附加说明行（如多页提示），始终展示。
+
+        Returns:
+            组装好的文本说明。
+        """
+        fields = self._caption_fields()
+        lines: list[str] = []
+        if "title" in fields and item.get("title"):
+            lines.append(f"标题：{item['title']}")
+        if "artist" in fields and item.get("userName"):
             lines.append(f"画师：{item['userName']}")
-        if item.get("id"):
+        if "id" in fields and item.get("id"):
             lines.append(f"ID：{item['id']}")
-        if item.get("bookmarkCount") is not None:
+        if "bookmark" in fields and item.get("bookmarkCount") is not None:
             lines.append(f"收藏：{item['bookmarkCount']}")
-        if item.get("likeCount") is not None:
+        if "like" in fields and item.get("likeCount") is not None:
             lines.append(f"喜欢：{item['likeCount']}")
-        if item.get("tags"):
-            tags = item["tags"]
-            if isinstance(tags, dict):
-                tags = [t.get("tag", "") for t in tags.get("tags", [])]
-            lines.append("标签：" + " ".join(str(t) for t in tags))
-        if item.get("id"):
+        if "tags" in fields and item.get("tags"):
+            tags = self._extract_tags(item["tags"])
+            if tags:
+                max_tags = max(int(self.config.get("max_tags", 10) or 10), 1)
+                shown = tags[:max_tags]
+                suffix = f" 等 {len(tags)} 个标签" if len(tags) > max_tags else ""
+                lines.append("标签：" + " ".join(shown) + suffix)
+        if "link" in fields and item.get("id"):
             lines.append(f"链接：https://www.pixiv.net/artworks/{item['id']}")
         if extra:
             lines.append(extra)
         return "\n".join(lines)
+
+    @staticmethod
+    def _extract_tags(tags) -> list[str]:
+        """把 Pixiv 返回的 tags 字段统一为字符串列表。
+
+        兼容两种结构：{"tags": [{"tag": "xxx"}, ...]} 与 ["xxx", ...]。
+        """
+        if isinstance(tags, dict):
+            tags = tags.get("tags") or []
+        if not isinstance(tags, list):
+            return []
+        out: list[str] = []
+        for t in tags:
+            if isinstance(t, dict):
+                t = t.get("tag") or ""
+            if isinstance(t, str) and t:
+                out.append(t)
+        return out
+
+    def _caption_chain(self, item: dict, img: Path, *, extra: str = "") -> list:
+        """组装作品回复消息链：文字说明（按配置勾选，可为空）+ 图片。
+
+        Args:
+            item: 作品对象。
+            img: 已下载的图片临时文件路径。
+            extra: 附加说明行。
+
+        Returns:
+            可直接用于 chain_result 的消息组件列表。
+        """
+        caption = self._caption(item, extra=extra)
+        chain: list = []
+        if caption:
+            chain.append(Plain(caption))
+        chain.append(Image.fromFileSystem(str(img)))
+        return chain
 
     def _load_font(self, size: int) -> ImageFont.ImageFont:
         """按优先级加载支持中文的字体，失败回退默认。"""
@@ -524,7 +603,8 @@ class PixivNowPlugin(Star):
             "/pixiv novel <id>  小说详情\n"
             "/pixiv seturl <地址>  设置 PixivNow 地址（管理员）\n"
             "/pixiv settoken <token>  设置 Pixiv 登录 token（管理员）\n"
-            "mode 可选：safe / all / r18"
+            "mode 可选：safe / all / r18\n"
+            "可在管理面板配置回复附带的信息字段（标题/画师/标签/链接等）"
         )
 
     @pixiv.command("random")
@@ -559,9 +639,7 @@ class PixivNowPlugin(Star):
         for idx, item in enumerate(works[:count], 1):
             try:
                 img = await self._download_best(item)
-                yield event.chain_result(
-                    [Plain(self._caption(item)), Image.fromFileSystem(str(img))]
-                )
+                yield event.chain_result(self._caption_chain(item, img))
             except PixivNowError as e:
                 logger.error(f"PixivNow random 图片发送失败: {e}")
                 yield event.plain_result(f"第 {idx} 张图片下载失败：{e}")
@@ -777,12 +855,7 @@ class PixivNowPlugin(Star):
             )
             item = detail if isinstance(detail, dict) else work
             img = await self._download_best(item)
-            yield event.chain_result(
-                [
-                    Plain(self._caption(item)),
-                    Image.fromFileSystem(str(img)),
-                ]
-            )
+            yield event.chain_result(self._caption_chain(item, img))
         except PixivNowError as e:
             yield event.plain_result(f"下载失败：{e}")
 
@@ -812,7 +885,8 @@ class PixivNowPlugin(Star):
         text = self._caption(body)
         if page_count > 1:
             text += f"\n共 {page_count} 页，先展示前 {min(page_count, max_pages)} 页"
-        yield event.plain_result(text)
+        if text:
+            yield event.plain_result(text)
 
         # 多页时优先展示各页
         if page_count > 1:

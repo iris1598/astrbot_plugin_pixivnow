@@ -45,5 +45,43 @@
     "description": "多页画作最多发送的页数上限（避免刷屏）",
     "type": "int",
     "default": 5
+  },
+  "caption_fields": {
+    "description": "回复作品时附带的信息字段（勾选需要展示的内容，不勾选则只发图片）",
+    "type": "list",
+    "default": [
+      "title",
+      "artist",
+      "id",
+      "bookmark",
+      "like",
+      "tags",
+      "link"
+    ],
+    "options": [
+      "title",
+      "artist",
+      "id",
+      "bookmark",
+      "like",
+      "tags",
+      "link"
+    ],
+    "labels": [
+      "标题",
+      "画师",
+      "作品ID",
+      "收藏数",
+      "喜欢数",
+      "标签",
+      "作品链接"
+    ],
+    "render_type": "checkbox",
+    "hint": "作用于随机插画、搜索选图与画作详情等回复。title=标题，artist=画师，id=作品ID，bookmark=收藏数，like=喜欢数，tags=标签，link=作品链接。"
+  },
+  "max_tags": {
+    "description": "回复中最多展示的标签数量（超过则省略并提示总数）",
+    "type": "int",
+    "default": 10
   }
 }

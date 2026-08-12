@@ -7,7 +7,8 @@ from urllib.parse import quote
 
 import httpx
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star
 from .pixiv_grid_renderer import PixivGridRenderer
@@ -59,6 +60,14 @@ class PixivNowPlugin(Star):
         self._temp_files: list[Path] = []
         # 搜索会话：{会话id: {"works": [...], "created": timestamp}}
         self._search_sessions: dict[str, dict] = {}
+
+    @staticmethod
+    def _is_onebot(event: AstrMessageEvent) -> bool:
+        """仅 OneBot v11（aiocqhttp）支持合并转发节点。"""
+        try:
+            return "aiocqhttp" in event.get_platform_name().lower()
+        except Exception:
+            return False
 
     # ── 基础工具 ──────────────────────────────────────────────────
 
@@ -263,6 +272,97 @@ class PixivNowPlugin(Star):
 
         asyncio.create_task(_del())
 
+    def _renderer(self) -> PixivGridRenderer:
+        """按当前配置创建统一主题渲染器。"""
+        theme = str(self.config.get("render_theme", "dark") or "dark").lower()
+        font_path = str(self.config.get("render_font_path", "") or "").strip()
+        return PixivGridRenderer(theme=theme, font_path=font_path or None)
+
+    def _save_canvas(self, canvas) -> Path:
+        """保存渲染结果到延迟清理的临时 PNG。"""
+        fd, path = tempfile.mkstemp(suffix=".png")
+        with os.fdopen(fd, "wb") as file:
+            canvas.save(file, format="PNG", optimize=True)
+        result = Path(path)
+        self._temp_files.append(result)
+        self._schedule_cleanup(result)
+        return result
+
+    async def _send_card_separately(
+        self, event: AstrMessageEvent, path: Path
+    ) -> bool:
+        """像 rika_share 一样主动单独发送信息卡，避免引用回复污染图片。"""
+        try:
+            sent = await self.context.send_message(
+                event.unified_msg_origin,
+                MessageChain().file_image(str(path)),
+            )
+            if sent:
+                logger.info(f"PixivNow 信息卡已单独发送: {path.name}")
+                return True
+            logger.warning(f"PixivNow 信息卡主动发送未找到匹配平台会话: {path.name}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"PixivNow 信息卡主动发送异常，将回退事件回复: {e}")
+        return False
+
+    async def _send_image_collection(
+        self,
+        event: AstrMessageEvent,
+        paths: list[Path],
+        header: str = "",
+    ):
+        """发送原图集合：OneBot 合并转发，其他平台使用普通图片消息链。"""
+        if not paths:
+            return
+        if self._is_onebot(event) and len(paths) > 1:
+            sender_name = event.get_sender_name()
+            sender_id = event.get_sender_id()
+            nodes = Comp.Nodes([])
+            if header:
+                nodes.nodes.append(
+                    Comp.Node(uin=sender_id, name=sender_name, content=[Comp.Plain(header)])
+                )
+            for path in paths:
+                nodes.nodes.append(
+                    Comp.Node(
+                        uin=sender_id,
+                        name=sender_name,
+                        content=[Comp.Image.fromFileSystem(str(path))],
+                    )
+                )
+            yield event.chain_result([nodes])
+            return
+
+        parts: list = []
+        if header:
+            parts.append(Comp.Plain(header))
+        parts.extend(Comp.Image.fromFileSystem(str(path)) for path in paths)
+        yield event.chain_result(parts)
+
+    async def _make_detail_card(
+        self,
+        kind: str,
+        data: dict,
+        media_url: str = "",
+    ) -> Path:
+        """下载详情卡媒体并调用对应渲染布局。"""
+        media: bytes | None = None
+        if kind == "illust":
+            media = await self._fetch_thumb_bytes(data)
+        elif media_url:
+            try:
+                media = await self._fetch_bytes(media_url)
+            except PixivNowError as e:
+                logger.warning(f"PixivNow {kind} 卡片媒体下载失败，使用占位图: {e}")
+        renderer = self._renderer()
+        render_method = {
+            "illust": renderer.render_illust_detail,
+            "user": renderer.render_user_detail,
+            "novel": renderer.render_novel_detail,
+        }[kind]
+        canvas = await asyncio.to_thread(render_method, data, media)
+        return self._save_canvas(canvas)
+
     def _mode_allowed(self, mode: str) -> bool:
         """校验内容模式是否允许使用。
 
@@ -432,9 +532,7 @@ class PixivNowPlugin(Star):
     ) -> Path:
         """下载排行榜缩略图并渲染为单张主题海报。"""
         thumbs = await asyncio.gather(*(self._fetch_thumb_bytes(item) for item in items))
-        theme = str(self.config.get("render_theme", "dark") or "dark").lower()
-        font_path = str(self.config.get("render_font_path", "") or "").strip()
-        renderer = PixivGridRenderer(theme=theme, font_path=font_path or None)
+        renderer = self._renderer()
         canvas = await asyncio.to_thread(
             renderer.render_ranking,
             items,
@@ -562,7 +660,8 @@ class PixivNowPlugin(Star):
                 page=max(p, 1),
                 date=str(date),
             )
-            yield event.chain_result([Image.fromFileSystem(str(card))])
+            if not await self._send_card_separately(event, card):
+                yield event.chain_result([Image.fromFileSystem(str(card))])
         except Exception as e:  # noqa: BLE001
             logger.error(f"PixivNow rank 排行榜渲染失败: {e}")
             yield event.plain_result(
@@ -635,15 +734,8 @@ class PixivNowPlugin(Star):
 
         try:
             grid = await self._make_grid(top, keyword=keyword, page=page, mode=mode)
-            yield event.chain_result(
-                [
-                    Plain(
-                        f"关键词「{keyword}」第 {page} 页 · 共 {len(top)} 个结果\n"
-                        "数字 1-9 选图 | N 下一页 | P 上一页 | P数字 跳页 | E 或 0 退出"
-                    ),
-                    Image.fromFileSystem(str(grid)),
-                ]
-            )
+            if not await self._send_card_separately(event, grid):
+                yield event.chain_result([Image.fromFileSystem(str(grid))])
         except PixivNowError as e:
             yield event.plain_result(f"结果获取/拼图生成失败：{e}")
 
@@ -762,23 +854,35 @@ class PixivNowPlugin(Star):
         max_pages = int(self.config.get("max_pages", 5) or 5)
         page_count = int(body.get("pageCount") or 1)
 
-        text = self._caption(body)
-        if page_count > 1:
-            text += f"\n共 {page_count} 页，先展示前 {min(page_count, max_pages)} 页"
-        if text:
-            yield event.plain_result(text)
+        try:
+            card = await self._make_detail_card(
+                "illust",
+                body,
+            )
+            if not await self._send_card_separately(event, card):
+                yield event.chain_result([Image.fromFileSystem(str(card))])
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"PixivNow illust 信息卡渲染失败: {e}")
+            text = self._caption(body)
+            if page_count > 1:
+                text += f"\n共 {page_count} 页，先展示前 {min(page_count, max_pages)} 页"
+            if text:
+                yield event.plain_result(text)
 
         # 多页时优先展示各页
         if page_count > 1:
             try:
                 pages = self._unwrap(await self._request(f"/ajax/illust/{id}/pages"))
                 if isinstance(pages, list):
+                    paths: list[Path] = []
                     for pg in pages[:max_pages]:
                         try:
-                            img = await self._download_best(pg)
-                            yield event.chain_result([Image.fromFileSystem(str(img))])
+                            paths.append(await self._download_best(pg))
                         except PixivNowError as e:
                             logger.error(f"PixivNow illust 分页发送失败: {e}")
+                    header = f"作品原图 · 共 {page_count} 页，展示前 {len(paths)} 页"
+                    async for result in self._send_image_collection(event, paths, header):
+                        yield result
                     return
             except PixivNowError as e:
                 logger.error(f"获取分页失败: {e}")
@@ -786,7 +890,8 @@ class PixivNowPlugin(Star):
         # 单页：发送主图
         try:
             img = await self._download_best(body)
-            yield event.chain_result([Image.fromFileSystem(str(img))])
+            async for result in self._send_image_collection(event, [img]):
+                yield result
         except PixivNowError as e:
             yield event.plain_result(str(e))
 
@@ -809,27 +914,21 @@ class PixivNowPlugin(Star):
             yield event.plain_result("未找到该画师。")
             return
 
-        # Pixiv /ajax/user/{id} 接口不返回 followers 字段（实测），
-        # 使用 following（关注数）与 mypixivCount（MyPixiv 收藏数）。
-        stats = f"关注：{body.get('following')}"
-        mypixiv = body.get("mypixivCount")
-        if mypixiv is not None:
-            stats += f"  MyPixiv：{mypixiv}"
-        text = (
-            f"画师：{body.get('name')}\n"
-            f"ID：{body.get('userId')}\n"
-            f"{stats}\n"
-            f"简介：{(body.get('comment') or '无').replace(chr(10), ' ')[:200]}\n"
-            f"主页：https://www.pixiv.net/users/{body.get('userId')}"
-        )
-        yield event.plain_result(text)
         avatar = body.get("imageBig") or body.get("image")
-        if avatar:
-            try:
-                img = await self._download(avatar)
-                yield event.chain_result([Image.fromFileSystem(str(img))])
-            except PixivNowError as e:
-                logger.error(f"PixivNow user 头像发送失败: {e}")
+        try:
+            card = await self._make_detail_card("user", body, str(avatar or ""))
+            if not await self._send_card_separately(event, card):
+                yield event.chain_result([Image.fromFileSystem(str(card))])
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"PixivNow user 信息卡渲染失败: {e}")
+            stats = f"关注：{body.get('following')}"
+            if body.get("mypixivCount") is not None:
+                stats += f"  MyPixiv：{body.get('mypixivCount')}"
+            yield event.plain_result(
+                f"画师：{body.get('name')}\nID：{body.get('userId')}\n{stats}\n"
+                f"简介：{(body.get('comment') or '无').replace(chr(10), ' ')[:200]}\n"
+                f"主页：https://www.pixiv.net/users/{body.get('userId')}"
+            )
 
     @pixiv.command("novel")
     async def pixiv_novel(self, event: AstrMessageEvent, id: str):
@@ -850,21 +949,24 @@ class PixivNowPlugin(Star):
             yield event.plain_result("未找到该小说。")
             return
 
-        content = body.get("content") or ""
-        # Pixiv novel 详情实际返回 wordCount/characterCount 与 useWordCount，
-        # 不存在 textCount（实测）。优先显示接口推荐的计数字段。
-        if body.get("useWordCount"):
-            count = body.get("wordCount")
-        else:
-            count = body.get("characterCount") or body.get("textCount")
-        text = (
-            f"标题：{body.get('title')}\n"
-            f"作者：{body.get('userName')}\n"
-            f"字数：{count if count is not None else '未知'}\n"
-            f"链接：https://www.pixiv.net/novel/show.php?id={body.get('id')}\n\n"
-            f"{content[:1000]}"
-        )
-        yield event.plain_result(text)
+        cover = body.get("coverUrl") or ""
+        try:
+            card = await self._make_detail_card("novel", body, str(cover))
+            if not await self._send_card_separately(event, card):
+                yield event.chain_result([Image.fromFileSystem(str(card))])
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"PixivNow novel 信息卡渲染失败: {e}")
+            count = (
+                body.get("wordCount")
+                if body.get("useWordCount")
+                else body.get("characterCount") or body.get("textCount")
+            )
+            yield event.plain_result(
+                f"标题：{body.get('title')}\n作者：{body.get('userName')}\n"
+                f"字数：{count if count is not None else '未知'}\n"
+                f"链接：https://www.pixiv.net/novel/show.php?id={body.get('id')}\n\n"
+                f"{str(body.get('content') or '')[:1000]}"
+            )
 
     @pixiv.command("seturl")
     @filter.permission_type(filter.PermissionType.ADMIN)

@@ -2,7 +2,7 @@ name: astrbot_plugin_pixivnow
 display_name: PixivNow
 desc: 通过自托管的 PixivNow 服务访问 Pixiv，支持随机插画、排行榜、搜索、画作详情、画师详情与小说阅读。图片经 PixivNow 代理下载，避免直连 Pixiv 的 403 与反爬问题。
 short_desc: 通过 PixivNow 访问 Pixiv 插画/排行榜/搜索/画师/小说
-version: 1.3.0
+version: 1.4.0
 author: astrbot_plugin_pixivnow
 astrbot_version: ">=4.9.2"
 tags:

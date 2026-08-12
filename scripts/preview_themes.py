@@ -74,6 +74,45 @@ def main() -> None:
         ranking.save(rank_path, "PNG", optimize=True)
         print(rank_path)
 
+        illust = {
+            "id": "125920001",
+            "title": "星降る夜の約束",
+            "userName": "Haru",
+            "bookmarkCount": 24831,
+            "likeCount": 19542,
+            "pageCount": 4,
+            "tags": {"tags": [{"tag": tag} for tag in ["原创", "少女", "星空", "幻想", "夜景"]]},
+        }
+        illust_image = PixivGridRenderer(theme=theme).render_illust_detail(illust, thumbs[0])
+        illust_path = out_dir / f"illust-detail-{theme}.png"
+        illust_image.save(illust_path, "PNG", optimize=True)
+        print(illust_path)
+
+        user = {
+            "userId": "9482103",
+            "name": "Haru",
+            "following": 386,
+            "mypixivCount": 128,
+            "comment": "日常与幻想系插画创作者。喜欢画星空、少女和安静的城市风景，感谢每一次收藏与关注。",
+        }
+        user_image = PixivGridRenderer(theme=theme).render_user_detail(user, thumbs[1])
+        user_path = out_dir / f"user-detail-{theme}.png"
+        user_image.save(user_path, "PNG", optimize=True)
+        print(user_path)
+
+        novel = {
+            "id": "28389206",
+            "title": "银河尽头的邮局",
+            "userName": "青空",
+            "useWordCount": True,
+            "wordCount": 12840,
+            "content": "在银河列车停运后的第七年，我收到了一封来自星海尽头的信。信封没有邮票，收件人却写着我的名字。为了找到寄信人，我重新踏上了那条已经从地图上消失的航线……",
+        }
+        novel_image = PixivGridRenderer(theme=theme).render_novel_detail(novel, thumbs[2])
+        novel_path = out_dir / f"novel-detail-{theme}.png"
+        novel_image.save(novel_path, "PNG", optimize=True)
+        print(novel_path)
+
 
 if __name__ == "__main__":
     main()

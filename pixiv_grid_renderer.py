@@ -481,3 +481,176 @@ class PixivGridRenderer:
         draw.ellipse((width - pad - brand_w - 47, footer_y + 23, width - pad - brand_w - 37, footer_y + 33), fill=(*ACCENT, 255))
         draw.text((width - pad - brand_w - 25, footer_y + 18), brand, font=meta_font, fill=theme.text_tertiary)
         return canvas.convert("RGB")
+
+    def _detail_base(self, height: int, section: str, title: str, subtitle: str = ""):
+        theme = self.theme
+        width, pad = 900, 42
+        canvas = self._gradient((width, height), theme.gradient_top, theme.gradient_bottom)
+        canvas.alpha_composite(self._radial_glow((width, height), (110, 55), ACCENT, theme.glow_alpha))
+        draw = ImageDraw.Draw(canvas)
+        draw.rounded_rectangle((pad, 28, pad + 64, 34), 3, fill=(*ACCENT, 230))
+        draw.text((pad, 52), section, font=self._font(17, bold=True), fill=ACCENT)
+        draw.text((pad, 82), self._fit_line(title, self._font(34, bold=True), width - pad * 2), font=self._font(34, bold=True), fill=theme.text_primary)
+        if subtitle:
+            draw.text((pad, 130), self._fit_line(subtitle, self._font(18), width - pad * 2), font=self._font(18), fill=theme.text_tertiary)
+        return canvas, draw
+
+    def _detail_footer(self, canvas: Image.Image, y: int, link: str = "") -> None:
+        theme = self.theme
+        width, pad = canvas.width, 42
+        draw = ImageDraw.Draw(canvas)
+        draw.rounded_rectangle((pad, y, width - pad, y + 54), 20, fill=theme.footer_fill, outline=theme.card_border)
+        label = self._fit_line(link or "PixivNow", self._font(17), width - pad * 2 - 180)
+        draw.text((pad + 20, y + 16), label, font=self._font(17), fill=theme.text_secondary)
+        brand = "PixivNow"
+        brand_w = self._font(17).getlength(brand)
+        draw.ellipse((width - pad - brand_w - 42, y + 22, width - pad - brand_w - 32, y + 32), fill=(*ACCENT, 255))
+        draw.text((width - pad - brand_w - 21, y + 16), brand, font=self._font(17), fill=theme.text_tertiary)
+
+    def render_illust_detail(self, item: dict, cover: bytes | None = None) -> Image.Image:
+        theme = self.theme
+        width, pad, hero_h = 900, 42, 500
+        title = str(item.get("title") or "无标题")
+        author = str(item.get("userName") or item.get("user_name") or "未知画师")
+        canvas, draw = self._detail_base(910, "PIXIV ARTWORK", title, f"@{author}")
+        try:
+            media = self._rounded_image(Image.open(io.BytesIO(cover)), (width - pad * 2, hero_h), 26) if cover else self._placeholder((width - pad * 2, hero_h))
+        except Exception:
+            media = self._placeholder((width - pad * 2, hero_h))
+        canvas.alpha_composite(media, (pad, 178))
+
+        info_y = 704
+        work_id = str(item.get("id") or item.get("illust_id") or "")
+        page_count = int(item.get("pageCount") or 1)
+        stats = []
+        if item.get("bookmarkCount") is not None:
+            stats.append(("收藏", str(item["bookmarkCount"])))
+        if item.get("likeCount") is not None:
+            stats.append(("喜欢", str(item["likeCount"])))
+        stats.extend((("页数", str(page_count)), ("作品 ID", work_id)))
+        x = pad
+        for label, value in stats:
+            text = f"{label}  {value}"
+            chip_w = round(self._font(17, bold=True).getlength(text)) + 30
+            draw.rounded_rectangle((x, info_y, x + chip_w, info_y + 40), 20, fill=theme.pill_fill, outline=theme.card_border)
+            draw.text((x + 15, info_y + 9), text, font=self._font(17, bold=True), fill=theme.text_secondary)
+            x += chip_w + 10
+
+        tags = item.get("tags") or []
+        if isinstance(tags, dict):
+            tags = tags.get("tags") or []
+        tag_names = [str(t.get("tag") if isinstance(t, dict) else t) for t in tags][:8]
+        tag_text = "  ".join(f"#{tag}" for tag in tag_names if tag)
+        if tag_text:
+            draw.text((pad, info_y + 62), self._fit_line(tag_text, self._font(17), width - pad * 2), font=self._font(17), fill=theme.text_tertiary)
+        self._detail_footer(canvas, 830, f"https://www.pixiv.net/artworks/{work_id}")
+        return canvas.convert("RGB")
+
+    def render_user_detail(self, user: dict, avatar: bytes | None = None) -> Image.Image:
+        theme = self.theme
+        width, pad = 900, 42
+        name = str(user.get("name") or "未知画师")
+        user_id = str(user.get("userId") or user.get("id") or "")
+        canvas, draw = self._detail_base(670, "PIXIV CREATOR", name, f"USER ID  {user_id}")
+        card_y = 184
+        draw.rounded_rectangle((pad, card_y, width - pad, 548), 28, fill=theme.card_fill, outline=theme.card_border)
+
+        avatar_size = 176
+        try:
+            source = Image.open(io.BytesIO(avatar)).convert("RGB") if avatar else self._placeholder((avatar_size, avatar_size)).convert("RGB")
+            fitted = ImageOps.fit(source, (avatar_size, avatar_size), method=Image.Resampling.LANCZOS).convert("RGBA")
+            mask = Image.new("L", (avatar_size, avatar_size), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, avatar_size - 1, avatar_size - 1), fill=255)
+            fitted.putalpha(mask)
+        except Exception:
+            fitted = self._placeholder((avatar_size, avatar_size))
+        canvas.alpha_composite(fitted, (pad + 32, card_y + 36))
+        draw = ImageDraw.Draw(canvas)
+        draw.ellipse((pad + 28, card_y + 32, pad + 32 + avatar_size + 4, card_y + 36 + avatar_size + 4), outline=(*ACCENT, 210), width=4)
+
+        text_x = pad + 242
+        stats = [
+            ("关注", user.get("following")),
+            ("MyPixiv", user.get("mypixivCount")),
+        ]
+        x = text_x
+        for label, value in stats:
+            if value is None:
+                continue
+            text = f"{label}  {value}"
+            chip_w = round(self._font(18, bold=True).getlength(text)) + 32
+            draw.rounded_rectangle((x, card_y + 42, x + chip_w, card_y + 84), 21, fill=theme.pill_fill, outline=theme.card_border)
+            draw.text((x + 16, card_y + 51), text, font=self._font(18, bold=True), fill=theme.text_secondary)
+            x += chip_w + 12
+
+        comment = " ".join(str(user.get("comment") or "这位画师还没有填写个人简介。").replace("\n", " ").split())
+        desc_font = self._font(20)
+        lines = []
+        rest = comment
+        while rest and len(lines) < 5:
+            line = self._fit_line(rest, desc_font, width - text_x - pad - 32)
+            if line.endswith("…"):
+                consumed = max(1, len(line) - 1)
+                lines.append(line[:-1])
+                rest = rest[consumed:]
+            else:
+                lines.append(line)
+                rest = ""
+        y = card_y + 122
+        for line in lines:
+            draw.text((text_x, y), line, font=desc_font, fill=theme.text_secondary)
+            y += 34
+        self._detail_footer(canvas, 578, f"https://www.pixiv.net/users/{user_id}")
+        return canvas.convert("RGB")
+
+    def render_novel_detail(self, novel: dict, cover: bytes | None = None) -> Image.Image:
+        theme = self.theme
+        width, pad = 900, 42
+        title = str(novel.get("title") or "无标题")
+        author = str(novel.get("userName") or "未知作者")
+        canvas, draw = self._detail_base(860, "PIXIV NOVEL", title, f"@{author}")
+        card_y = 184
+        draw.rounded_rectangle((pad, card_y, width - pad, 738), 28, fill=theme.card_fill, outline=theme.card_border)
+        cover_w, cover_h = 260, 390
+        try:
+            media = self._rounded_image(Image.open(io.BytesIO(cover)), (cover_w, cover_h), 22) if cover else self._placeholder((cover_w, cover_h))
+        except Exception:
+            media = self._placeholder((cover_w, cover_h))
+        canvas.alpha_composite(media, (pad + 26, card_y + 28))
+
+        text_x = pad + 318
+        use_words = novel.get("wordCount") if novel.get("useWordCount") else novel.get("characterCount") or novel.get("textCount")
+        chips = [("字数", use_words if use_words is not None else "未知"), ("小说 ID", novel.get("id") or "")]
+        x = text_x
+        for label, value in chips:
+            text = f"{label}  {value}"
+            chip_w = round(self._font(17, bold=True).getlength(text)) + 28
+            draw.rounded_rectangle((x, card_y + 30, x + chip_w, card_y + 70), 20, fill=theme.pill_fill, outline=theme.card_border)
+            draw.text((x + 14, card_y + 39), text, font=self._font(17, bold=True), fill=theme.text_secondary)
+            x += chip_w + 10
+
+        content = " ".join(str(novel.get("content") or novel.get("description") or "暂无正文摘要").replace("\n", " ").split())
+        body_font = self._font(20)
+        max_w = width - text_x - pad - 28
+        y = card_y + 100
+        line = ""
+        lines = []
+        for char in content:
+            test = line + char
+            if body_font.getlength(test) > max_w and line:
+                lines.append(line)
+                line = char
+                if len(lines) >= 10:
+                    break
+            else:
+                line = test
+        if line and len(lines) < 10:
+            lines.append(line)
+        if len("".join(lines)) < len(content) and lines:
+            lines[-1] = self._fit_line(lines[-1] + "…", body_font, max_w)
+        for line in lines:
+            draw.text((text_x, y), line, font=body_font, fill=theme.text_secondary)
+            y += 33
+        novel_id = str(novel.get("id") or "")
+        self._detail_footer(canvas, 768, f"https://www.pixiv.net/novel/show.php?id={novel_id}")
+        return canvas.convert("RGB")

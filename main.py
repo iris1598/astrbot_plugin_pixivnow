@@ -17,6 +17,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Image, Plain
+from astrbot.api.platform import MessageType
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
@@ -116,10 +117,13 @@ class PixivNowPlugin(Star):
         # LLM 工具开关：开启时注册，关闭后 AI 无法调用该工具
         if self._cfg("llm_tool_enabled", True):
             self.context.add_llm_tools(PixivKeywordRandomTool(plugin=self))
+        # 图片自动撤回的待执行任务（插件卸载时一并取消）
+        self._recall_tasks: list[asyncio.Task] = []
+        self._withdraw_unsupported_warned = False
 
     def _cfg(self, key: str, default=None):
         """从新版分组配置读取值。"""
-        for group in ("基础配置", "高级配置", "LLM 工具"):
+        for group in ("基础配置", "高级配置", "LLM 工具", "额外设置"):
             group_data = self.config.get(group)
             if isinstance(group_data, dict) and key in group_data:
                 return group_data.get(key, default)
@@ -497,10 +501,93 @@ class PixivNowPlugin(Star):
         page = number if default_page is not None and number is not None else default_page
         return " ".join(tokens).strip(), count, page, mode
 
+    def _auto_withdraw_enabled(self) -> bool:
+        """是否开启图片自动撤回。"""
+        return bool(self._cfg("auto_withdraw_enabled", False))
+
+    def _auto_withdraw_seconds(self) -> int:
+        """自动撤回延时（秒），限制在 5-3600 之间。"""
+        return min(max(int(self._cfg("auto_withdraw_seconds", 60) or 60), 5), 3600)
+
+    def _schedule_recall(self, bot, message_id, delay: int) -> None:
+        """延时调用 OneBot v11 delete_msg 撤回指定消息。
+
+        Args:
+            bot: aiocqhttp CQHttp 实例。
+            message_id: OneBot 消息 ID。
+            delay: 延迟秒数。
+        """
+
+        async def _recall() -> None:
+            await asyncio.sleep(delay)
+            try:
+                await bot.call_action("delete_msg", message_id=message_id)
+                logger.info(f"PixivNow 已自动撤回图片消息: {message_id}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"PixivNow 自动撤回图片失败: {e}")
+
+        task = asyncio.create_task(_recall())
+        self._recall_tasks.append(task)
+
+    async def _send_onebot_image_with_recall(
+        self, event: AstrMessageEvent, path: Path
+    ) -> bool:
+        """经 OneBot v11 API 发送单张图片，并在设定时间后自动撤回。
+
+        Args:
+            event: 当前消息事件（须为 aiocqhttp）。
+            path: 图片临时文件路径。
+
+        Returns:
+            是否发送成功。
+        """
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return False
+        try:
+            bs64 = await Comp.Image.fromFileSystem(str(path)).convert_to_base64()
+            seg = {"type": "image", "data": {"file": f"base64://{bs64}"}}
+            routing = {}
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            if isinstance(raw, dict) and raw.get("self_id"):
+                routing["self_id"] = raw["self_id"]
+            if event.get_message_type() == MessageType.GROUP_MESSAGE:
+                resp = await bot.call_action(
+                    "send_group_msg",
+                    group_id=int(event.get_group_id()),
+                    message=[seg],
+                    **routing,
+                )
+            else:
+                resp = await bot.call_action(
+                    "send_private_msg",
+                    user_id=int(event.get_sender_id()),
+                    message=[seg],
+                    **routing,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"PixivNow 自动撤回模式发送图片失败: {e}")
+            return False
+        if isinstance(resp, dict) and resp.get("message_id") is not None:
+            self._schedule_recall(bot, resp["message_id"], self._auto_withdraw_seconds())
+        return True
+
     async def _send_card_separately(
         self, event: AstrMessageEvent, path: Path
     ) -> bool:
-        """像 rika_share 一样主动单独发送信息卡，避免引用回复污染图片。"""
+        """像 rika_share 一样主动单独发送信息卡，避免引用回复污染图片。
+
+        开启自动撤回且为 OneBot v11 平台时，改用 OneBot API 发送并在设定时间后自动撤回。
+        """
+        if self._auto_withdraw_enabled():
+            if self._is_onebot(event):
+                if await self._send_onebot_image_with_recall(event, path):
+                    return True
+            elif not self._withdraw_unsupported_warned:
+                self._withdraw_unsupported_warned = True
+                logger.warning(
+                    "PixivNow 自动撤回仅在 OneBot v11（aiocqhttp）平台生效，其他平台将按普通方式发送。"
+                )
         try:
             sent = await self.context.send_message(
                 event.unified_msg_origin,
@@ -520,8 +607,23 @@ class PixivNowPlugin(Star):
         paths: list[Path],
         header: str = "",
     ):
-        """发送原图集合：OneBot 合并转发，其他平台使用普通图片消息链。"""
+        """发送原图集合：OneBot 合并转发，其他平台使用普通图片消息链。
+
+        开启自动撤回且为 OneBot v11 时改为逐张发送，使每张图片都可单独撤回。
+        """
         if not paths:
+            return
+        if self._auto_withdraw_enabled() and self._is_onebot(event):
+            if header:
+                try:
+                    await self.context.send_message(
+                        event.unified_msg_origin,
+                        MessageChain().message(header),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"PixivNow 自动撤回模式发送头部消息失败: {e}")
+            for path in paths:
+                await self._send_onebot_image_with_recall(event, path)
             return
         if self._is_onebot(event) and len(paths) > 1:
             sender_name = event.get_sender_name()
@@ -685,13 +787,29 @@ class PixivNowPlugin(Star):
         chain.append(Image.fromFileSystem(str(img)))
         return chain
 
-    def _search_selection_result(
+    async def _search_selection_result(
         self,
         event: AstrMessageEvent,
         item: dict,
         img: Path,
     ):
-        """构造搜索选图回复；OneBot 将文字与原图拆为合并转发节点。"""
+        """构造搜索选图回复；OneBot 将文字与原图拆为合并转发节点。
+
+        开启自动撤回且为 OneBot v11 时改为逐张发送，以便图片可单独撤回。
+        """
+        if self._auto_withdraw_enabled() and self._is_onebot(event):
+            caption = self._caption(item)
+            if caption:
+                try:
+                    await self.context.send_message(
+                        event.unified_msg_origin,
+                        MessageChain().message(caption),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"PixivNow 自动撤回模式发送文字失败: {e}")
+            await self._send_onebot_image_with_recall(event, img)
+            return event.chain_result([])
+
         caption = self._caption(item)
         if not self._is_onebot(event):
             return event.chain_result(self._caption_chain(item, img))
@@ -732,13 +850,38 @@ class PixivNowPlugin(Star):
         detail = self._unwrap(await self._request(f"/ajax/illust/{item['id']}?full=1"))
         return detail if isinstance(detail, dict) else item
 
-    def _artwork_collection_result(
+    async def _artwork_collection_result(
         self,
         event: AstrMessageEvent,
         artworks: list[tuple[dict, Path]],
         header: str = "",
     ):
-        """统一发送一组作品；OneBot 多图使用合并转发，减少消息条数。"""
+        """统一发送一组作品；OneBot 多图使用合并转发，减少消息条数。
+
+        开启自动撤回且为 OneBot v11 时改为逐张发送，以便每张图片可单独撤回。
+        """
+        if self._auto_withdraw_enabled() and self._is_onebot(event):
+            if header:
+                try:
+                    await self.context.send_message(
+                        event.unified_msg_origin,
+                        MessageChain().message(header),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"PixivNow 自动撤回模式发送头部消息失败: {e}")
+            for item, path in artworks:
+                caption = self._caption(item)
+                if caption:
+                    try:
+                        await self.context.send_message(
+                            event.unified_msg_origin,
+                            MessageChain().message(caption),
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"PixivNow 自动撤回模式发送文字失败: {e}")
+                await self._send_onebot_image_with_recall(event, path)
+            return event.chain_result([])
+
         if self._is_onebot(event) and len(artworks) > 1:
             sender_name = event.get_sender_name()
             sender_id = event.get_sender_id()
@@ -951,7 +1094,7 @@ class PixivNowPlugin(Star):
             else:
                 logger.error(f"PixivNow random 第 {index} 张下载失败: {result}")
         if ready:
-            yield self._artwork_collection_result(event, ready, f"Pixiv 随机插画 · {mode.upper()}")
+            yield await self._artwork_collection_result(event, ready, f"Pixiv 随机插画 · {mode.upper()}")
         elif downloads:
             yield event.plain_result("随机插画下载失败，请稍后重试。")
 
@@ -1008,7 +1151,7 @@ class PixivNowPlugin(Star):
             else:
                 logger.error(f"PixivNow 关键词随机第 {index} 张发送失败: {result}")
         if ready:
-            yield self._artwork_collection_result(
+            yield await self._artwork_collection_result(
                 event,
                 ready,
                 f"关键词随机 · {keyword} · {mode.upper()}",
@@ -1127,14 +1270,8 @@ class PixivNowPlugin(Star):
             path = await self._download_best(item)
         except PixivNowError as e:
             return str(e)
-        try:
-            await self.context.send_message(
-                event.unified_msg_origin,
-                MessageChain().file_image(str(path)),
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"PixivNow LLM 工具发送图片失败: {e}")
-            return f"图片发送失败：{e}"
+        if not await self._send_card_separately(event, path):
+            return "图片发送失败。"
 
         mode = str(
             self._cfg("llm_tool_reply_mode", "with_description") or "with_description"
@@ -1363,7 +1500,7 @@ class PixivNowPlugin(Star):
         try:
             item = await self._enrich_illust(work)
             img = await self._download_best(item)
-            yield self._search_selection_result(event, item, img)
+            yield await self._search_selection_result(event, item, img)
         except PixivNowError as e:
             yield event.plain_result(f"下载失败：{e}")
         finally:
@@ -1541,9 +1678,11 @@ class PixivNowPlugin(Star):
         yield event.plain_result("已设置 Pixiv 登录 token。")
 
     async def terminate(self):
-        """插件卸载/停用时清理临时文件。"""
+        """插件卸载/停用时清理临时文件与未完成的撤回任务。"""
         if self._http_client is not None and not self._http_client.is_closed:
             await self._http_client.aclose()
+        for task in getattr(self, "_recall_tasks", []):
+            task.cancel()
         for p in self._temp_files:
             try:
                 p.unlink(missing_ok=True)

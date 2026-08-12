@@ -174,5 +174,25 @@
         "obvious_hint": false
       }
     }
+  },
+  "额外设置": {
+    "type": "object",
+    "description": "图片自动撤回等额外功能",
+    "items": {
+      "auto_withdraw_enabled": {
+        "description": "启用图片自动撤回",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后本插件发送的所有图片都会在设定时间后自动撤回；当前仅 OneBot v11（aiocqhttp）平台支持，其他平台自动忽略",
+        "obvious_hint": true
+      },
+      "auto_withdraw_seconds": {
+        "description": "自动撤回延时（秒）",
+        "type": "int",
+        "default": 60,
+        "hint": "图片发送后多少秒自动撤回；范围 5-3600",
+        "obvious_hint": false
+      }
+    }
   }
 }

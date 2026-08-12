@@ -470,6 +470,37 @@ class PixivNowPlugin(Star):
         chain.append(Image.fromFileSystem(str(img)))
         return chain
 
+    def _search_selection_result(
+        self,
+        event: AstrMessageEvent,
+        item: dict,
+        img: Path,
+    ):
+        """构造搜索选图回复；OneBot 将文字与原图拆为合并转发节点。"""
+        caption = self._caption(item)
+        if not self._is_onebot(event):
+            return event.chain_result(self._caption_chain(item, img))
+
+        sender_name = event.get_sender_name()
+        sender_id = event.get_sender_id()
+        nodes = Comp.Nodes([])
+        if caption:
+            nodes.nodes.append(
+                Comp.Node(
+                    uin=sender_id,
+                    name=sender_name,
+                    content=[Comp.Plain(caption)],
+                )
+            )
+        nodes.nodes.append(
+            Comp.Node(
+                uin=sender_id,
+                name=sender_name,
+                content=[Comp.Image.fromFileSystem(str(img))],
+            )
+        )
+        return event.chain_result([nodes])
+
     async def _fetch_thumb_bytes(self, item: dict) -> bytes | None:
         """下载单个作品的缩略图字节，失败返回 None。"""
         for url in self._url_candidates(item, prefer_thumb=True):
@@ -842,7 +873,7 @@ class PixivNowPlugin(Star):
             )
             item = detail if isinstance(detail, dict) else work
             img = await self._download_best(item)
-            yield event.chain_result(self._caption_chain(item, img))
+            yield self._search_selection_result(event, item, img)
         except PixivNowError as e:
             yield event.plain_result(f"下载失败：{e}")
 

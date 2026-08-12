@@ -1,5 +1,4 @@
 import asyncio
-import io
 import os
 import re
 import tempfile
@@ -11,8 +10,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star
-from PIL import Image as PILImage
-from PIL import ImageDraw, ImageFont
+from .pixiv_grid_renderer import PixivGridRenderer
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -366,43 +364,6 @@ class PixivNowPlugin(Star):
         chain.append(Image.fromFileSystem(str(img)))
         return chain
 
-    def _load_font(self, size: int) -> ImageFont.ImageFont:
-        """按优先级加载支持中文的字体，失败回退默认。"""
-        for path in (
-            "msyh.ttc",
-            "msyh.ttf",
-            "Microsoft YaHei.ttf",
-            "simhei.ttf",
-            "PingFang.ttc",
-            "NotoSansCJK-Regular.ttc",
-            "arial.ttf",
-        ):
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                continue
-        return ImageFont.load_default()
-
-    def _wrap_text(
-        self, text: str, font: ImageFont.ImageFont, max_width: int
-    ) -> list[str]:
-        """按像素宽度把字符串折行为多行。"""
-        if not text:
-            return []
-        line = ""
-        lines: list[str] = []
-        for ch in text:
-            test = line + ch
-            bbox = font.getbbox(test)
-            if bbox[2] - bbox[0] > max_width and line:
-                lines.append(line)
-                line = ch
-            else:
-                line = test
-        if line:
-            lines.append(line)
-        return lines
-
     async def _fetch_thumb_bytes(self, item: dict) -> bytes | None:
         """下载单个作品的缩略图字节，失败返回 None。"""
         for url in self._url_candidates(item, prefer_thumb=True):
@@ -437,126 +398,14 @@ class PixivNowPlugin(Star):
         Raises:
             PixivNowError: 合成失败时。
         """
-        # 画布尺寸
-        cell_w, cell_h = 320, 360  # 每格宽高（足够放下 1 行标题 + 1 行画师）
-        thumb_size = 300  # 缩略图实际像素
-        pad = 12
-        rows = (len(items) + columns - 1) // columns
-        grid_w = columns * cell_w + (columns + 1) * pad
-        grid_h = rows * cell_h + (rows + 1) * pad
-        header_h = 60
-        footer_h = 44
-        canvas_w = grid_w
-        canvas_h = header_h + grid_h + footer_h
-
-        bg_color = (24, 24, 28)
-        header_color = (42, 92, 170)
-        cell_bg = (245, 245, 248)
-        text_color = (20, 20, 20)
-        sub_color = (110, 110, 120)
-        badge_color = (220, 60, 70)
-        footer_color = (240, 240, 245)
-        footer_text = (80, 80, 95)
-
-        canvas = PILImage.new("RGB", (canvas_w, canvas_h), bg_color)
-        draw = ImageDraw.Draw(canvas)
-
-        # 字体
-        font_title = self._load_font(22)
-        font_sub = self._load_font(18)
-        font_header = self._load_font(22)
-        font_footer = self._load_font(18)
-        font_badge = self._load_font(28)
-
-        # 头部：搜索关键词条
-        draw.rectangle([0, 0, canvas_w, header_h], fill=header_color)
-        kw_part = f"  🔍 {keyword or '搜索结果'}"
-        draw.text((pad, 18), kw_part, fill=(255, 255, 255), font=font_header)
-        if page > 0:
-            right_text = f"第 {page} 页 · {len(items)} 个"
-            if mode:
-                right_text += f" · {mode}"
-            rb = font_header.getbbox(right_text)
-            rw = rb[2] - rb[0]
-            draw.text(
-                (canvas_w - pad - rw - rb[0], 18),
-                right_text,
-                fill=(220, 230, 255),
-                font=font_header,
-            )
-
         # 并发下载所有缩略图
         thumbs_data = await asyncio.gather(
-            *(self._fetch_thumb_bytes(it) for it in items[: columns * rows])
+            *(self._fetch_thumb_bytes(it) for it in items)
         )
-
-        for idx, (item, raw) in enumerate(zip(items[: columns * rows], thumbs_data)):
-            col = idx % columns
-            row = idx // columns
-            x0 = pad + col * (cell_w + pad)
-            y0 = header_h + pad + row * (cell_h + pad)
-            x1 = x0 + cell_w
-            y1 = y0 + cell_h
-
-            # 卡片底色（圆角矩形）
-            self._rounded_rect(draw, [x0, y0, x1, y1], radius=10, fill=cell_bg)
-
-            # 缩略图
-            tx = x0 + (cell_w - thumb_size) // 2
-            ty = y0 + 10
-            if raw:
-                try:
-                    thumb = PILImage.open(io.BytesIO(raw)).convert("RGB")
-                    thumb.thumbnail((thumb_size, thumb_size))
-                    canvas.paste(thumb, (tx + (thumb_size - thumb.width) // 2, ty))
-                except Exception:  # noqa: BLE001
-                    self._placeholder(draw, [tx, ty, tx + thumb_size, ty + thumb_size])
-            else:
-                self._placeholder(draw, [tx, ty, tx + thumb_size, ty + thumb_size])
-
-            # 红色圆序号（左上角）
-            cx, cy, r = x0 + 22, y0 + 22, 18
-            draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=badge_color)
-            num = str(idx + 1)
-            nb = font_badge.getbbox(num)
-            nw, nh = nb[2] - nb[0], nb[3] - nb[1]
-            draw.text(
-                (cx - nw / 2 - nb[0], cy - nh / 2 - nb[1]),
-                num,
-                fill=(255, 255, 255),
-                font=font_badge,
-            )
-
-            # 标题与画师
-            title = str(item.get("title") or "无标题").replace("\n", " ")
-            user = str(item.get("userName") or "未知画师")
-            title_max_w = cell_w - 16
-            # 拼图单元格空间有限，标题最多 1 行（完整标题在选图下载时通过 _caption 展示）
-            wrapped = self._wrap_text(title, font_title, title_max_w)[:1]
-            text_y = y0 + thumb_size + 14
-            for line in wrapped:
-                draw.text((x0 + 8, text_y), line, fill=text_color, font=font_title)
-            # 画师行紧跟标题下方
-            draw.text(
-                (x0 + 8, text_y + 28),
-                f"@{user}",
-                fill=sub_color,
-                font=font_sub,
-            )
-
-        # 底部提示条
-        draw.rectangle([0, canvas_h - footer_h, canvas_w, canvas_h], fill=footer_color)
-        footer_msg = (
-            "1-9 选图  |  N 下一页  |  P 上一页  |  P数字 跳页  |  E/0 退出  "
-            f"·  {SEARCH_SESSION_TTL}s 无操作自动退出"
-        )
-        fb = font_footer.getbbox(footer_msg)
-        fw = fb[2] - fb[0]
-        draw.text(
-            ((canvas_w - fw) // 2 - fb[0], canvas_h - footer_h + 12),
-            footer_msg,
-            fill=footer_text,
-            font=font_footer,
+        theme = str(self.config.get("render_theme", "dark") or "dark").lower()
+        renderer = PixivGridRenderer(theme=theme, columns=columns)
+        canvas = await asyncio.to_thread(
+            renderer.render, items, thumbs_data, keyword, page, mode
         )
 
         fd, path = tempfile.mkstemp(suffix=".png")
@@ -566,16 +415,6 @@ class PixivNowPlugin(Star):
         self._temp_files.append(p)
         self._schedule_cleanup(p)
         return p
-
-    def _rounded_rect(
-        self, draw: ImageDraw.ImageDraw, xy: list, radius: int, fill: tuple
-    ) -> None:
-        """绘制圆角矩形。"""
-        draw.rounded_rectangle(xy, radius=radius, fill=fill)
-
-    def _placeholder(self, draw: ImageDraw.ImageDraw, xy: list) -> None:
-        """在缩略图位置绘制占位色块。"""
-        draw.rectangle(xy, fill=(200, 200, 210))
 
     # ── 命令组 ────────────────────────────────────────────────────
 

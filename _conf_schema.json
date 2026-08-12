@@ -41,6 +41,20 @@
     "type": "int",
     "default": 20
   },
+  "render_theme": {
+    "description": "搜索结果图片的渲染主题",
+    "type": "string",
+    "default": "dark",
+    "options": [
+      "dark",
+      "light"
+    ],
+    "labels": [
+      "暗色",
+      "亮色"
+    ],
+    "hint": "采用与 rika_share 相同的柔和渐变、品牌色光晕和磨砂卡片视觉语言。"
+  },
   "max_pages": {
     "description": "多页画作最多发送的页数上限（避免刷屏）",
     "type": "int",

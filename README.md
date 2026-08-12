@@ -10,6 +10,7 @@
 
 - **随机插画** —— 不带关键词的随机抽取，支持批量（1–10 张）
 - **关键词随机** —— 在关键词搜索结果中按需取多页凑齐候选池再随机
+- **LLM 工具** —— 注册 `pixiv_keyword_random` 工具，AI 可按关键词随机挑选一张插画（固定 safe 模式）并发送给用户；可选是否附视觉模型转述描述
 - **关键词搜索** —— 进入交互式选图会话，支持翻页 / 跳页 / 选图下载原图
 - **排行榜** —— 渲染为单张主题海报（Top 5），含日 / 周 / 月 / 新人 / 男性 / 女性等模式
 - **画作详情** —— 主题信息卡 + 多页原图（OneBot 平台走合并转发）
@@ -108,6 +109,26 @@
 
 ---
 
+## LLM 工具（AI 调用）
+
+插件注册了名为 `pixiv_keyword_random` 的 LLM 工具：AI 在对话中按关键词即可随机返回一张 Pixiv 插画（**固定 safe 模式**，复用「关键词随机」的搜索逻辑）。相关设置集中在管理面板的 **LLM 工具** 分组中。
+
+工具参数：
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `keyword` | string | 搜索关键词，可用空格分隔多个词（如「原神 风景」） |
+
+- **开关**：`llm_tool_enabled` 可整体启用 / 停用该工具，关闭后 AI 将无法调用（修改后需重启 AstrBot）。
+- **返回方式**：`llm_tool_reply_mode`
+  - `with_description`（默认）：先发图，再调用视觉模型描述画面内容，将描述转述给用户；
+  - `image_only`：仅发图，工具结果只告知 LLM「图片已发送」。
+- **视觉转述模型**：`llm_tool_vision_provider` 可在管理面板下拉选择用于描述画面的视觉模型；不选择则使用当前会话的聊天模型。描述提示词可通过 `llm_tool_vision_prompt` 自定义。
+
+视觉模型不支持图像输入或调用失败时，自动跳过描述，只发送图片与作品信息。
+
+---
+
 ## 预览
 
 | 排行榜 | 搜索网格 |
@@ -165,6 +186,17 @@
 | `max_memory_image_mb` | int | `6` | 单张图片内存缓存上限（MB，`0` 禁用） |
 
 > EdgeOne / Serverless 部署建议关闭 KeepAlive；常驻自建服务可启用短时复用提升吞吐。
+
+### LLM 工具
+
+| 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `llm_tool_enabled` | bool | `true` | 是否注册 `pixiv_keyword_random` 工具；关闭后 AI 无法调用（修改后需重启） |
+| `llm_tool_reply_mode` | enum | `with_description` | 返回方式：`with_description`（发图并转述视觉描述）/ `image_only`（仅发图） |
+| `llm_tool_vision_provider` | string | 空 | 视觉转述模型（下拉选择提供商）；不选择则使用当前会话的聊天模型 |
+| `llm_tool_vision_prompt` | string | 见下方 | `with_description` 模式下视觉模型描述图片的提示词 |
+
+> `llm_tool_vision_provider` 填写的提供商 ID 需支持图像输入，可在 AstrBot 管理面板的模型提供商设置中查看；调用失败时自动跳过描述，只发送图片与作品信息。
 
 ---
 

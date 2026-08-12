@@ -137,5 +137,42 @@
         "obvious_hint": false
       }
     }
+  },
+  "LLM 工具": {
+    "type": "object",
+    "description": "LLM 工具（pixiv_keyword_random）的开关、返回方式与视觉转述模型",
+    "items": {
+      "llm_tool_enabled": {
+        "description": "启用 LLM 工具（pixiv_keyword_random）",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后 AI 将无法调用该工具，修改后需重启 AstrBot 生效",
+        "obvious_hint": true
+      },
+      "llm_tool_reply_mode": {
+        "description": "LLM 工具返回方式",
+        "type": "string",
+        "default": "with_description",
+        "options": ["with_description", "image_only"],
+        "labels": ["发图并转述视觉描述", "仅发图"],
+        "hint": "with_description：发图后调用视觉模型转述画面描述并追加到工具结果；image_only：仅发图，工具结果只告知 LLM 已发送",
+        "obvious_hint": true
+      },
+      "llm_tool_vision_provider": {
+        "description": "视觉转述模型（提供商）",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "点击选择用于描述画面的视觉模型；不选择则使用当前会话的聊天模型",
+        "obvious_hint": true
+      },
+      "llm_tool_vision_prompt": {
+        "description": "视觉模型描述提示词",
+        "type": "string",
+        "default": "请用中文描述这张 Pixiv 插画的画面内容，包括主体、构图、氛围、色彩等，200 字以内。",
+        "hint": "仅 with_description 模式生效；模型不支持图像输入或调用失败时自动跳过描述",
+        "obvious_hint": false
+      }
+    }
   }
 }

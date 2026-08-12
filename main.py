@@ -7,14 +7,20 @@ import re
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 import httpx
+from pydantic import Field
+from pydantic.dataclasses import dataclass
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star
+from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.agent.tool import FunctionTool, ToolExecResult
+from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.star.filter.command import GreedyStr
 from .pixiv_grid_renderer import PixivGridRenderer
 
@@ -46,6 +52,39 @@ CAPTION_FIELD_NAMES: dict[str, str] = {
 # 所有合法字段（与 _conf_schema.json 中 caption_fields 的 options 保持一致）
 ALL_CAPTION_FIELDS: tuple[str, ...] = tuple(CAPTION_FIELD_NAMES)
 
+
+@dataclass
+class PixivKeywordRandomTool(FunctionTool[AstrAgentContext]):
+    """LLM 工具：按关键词在 Pixiv 随机挑选一张插画并发送给用户。
+
+    plugin 持有插件实例，以便复用关键词随机、下载与视觉转述逻辑。
+    """
+
+    plugin: Any = None
+    name: str = "pixiv_keyword_random"
+    description: str = (
+        "根据关键词在 Pixiv 随机挑选一张插画，并把图片发送给用户（固定 safe 模式）。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "keyword": {
+                    "type": "string",
+                    "description": "搜索关键词，可用空格分隔多个词，例如「原神 风景」",
+                },
+            },
+            "required": ["keyword"],
+        }
+    )
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        keyword = str(kwargs.get("keyword", "") or "").strip()
+        return await self.plugin._pixiv_keyword_random_tool_impl(context, keyword)
+
+
 class PixivNowError(Exception):
     """PixivNow/Pixiv 接口调用异常。"""
 
@@ -74,10 +113,13 @@ class PixivNowPlugin(Star):
         self._network_semaphore = asyncio.Semaphore(
             min(max(int(self._cfg("max_concurrent_requests", 6) or 6), 1), 16)
         )
+        # LLM 工具开关：开启时注册，关闭后 AI 无法调用该工具
+        if self._cfg("llm_tool_enabled", True):
+            self.context.add_llm_tools(PixivKeywordRandomTool(plugin=self))
 
     def _cfg(self, key: str, default=None):
         """从新版分组配置读取值。"""
-        for group in ("基础配置", "高级配置"):
+        for group in ("基础配置", "高级配置", "LLM 工具"):
             group_data = self.config.get(group)
             if isinstance(group_data, dict) and key in group_data:
                 return group_data.get(key, default)
@@ -949,6 +991,44 @@ class PixivNowPlugin(Star):
             yield event.plain_result("R18 模式未启用，或模式参数非法。")
             return
 
+        selected, error = await self._keyword_random_selection(keyword, count, mode)
+        if error:
+            yield event.plain_result(error)
+            return
+
+        async def prepare(work: dict):
+            item = await self._enrich_illust(work)
+            return item, await self._download_best(item)
+
+        prepared = await asyncio.gather(*(prepare(work) for work in selected), return_exceptions=True)
+        ready: list[tuple[dict, Path]] = []
+        for index, result in enumerate(prepared, 1):
+            if isinstance(result, tuple):
+                ready.append(result)
+            else:
+                logger.error(f"PixivNow 关键词随机第 {index} 张发送失败: {result}")
+        if ready:
+            yield self._artwork_collection_result(
+                event,
+                ready,
+                f"关键词随机 · {keyword} · {mode.upper()}",
+            )
+        else:
+            yield event.plain_result("候选作品下载失败，请稍后重试。")
+
+    async def _keyword_random_selection(
+        self, keyword: str, count: int, mode: str
+    ) -> tuple[list[dict], str]:
+        """按关键词搜索并随机抽取候选作品。
+
+        Args:
+            keyword: 搜索关键词。
+            count: 期望抽取的数量。
+            mode: safe/all/r18。
+
+        Returns:
+            二元组 (选中作品列表, 错误信息)；成功时错误信息为空字符串。
+        """
         page_count = min(
             max(int(self._cfg("keyword_random_pages", 3) or 3), 1),
             10,
@@ -974,32 +1054,99 @@ class PixivNowPlugin(Star):
 
         if not works:
             if last_error:
-                yield event.plain_result(str(last_error))
-            else:
-                yield event.plain_result(f"没有搜索到与「{keyword}」相关的插画。")
-            return
+                return [], str(last_error)
+            return [], f"没有搜索到与「{keyword}」相关的插画。"
 
         selected = random.sample(works, min(count, len(works)))
+        return selected, ""
 
-        async def prepare(work: dict):
-            item = await self._enrich_illust(work)
-            return item, await self._download_best(item)
+    async def _describe_image(
+        self, event: AstrMessageEvent, path: Path
+    ) -> str:
+        """调用视觉转述模型描述图片内容。
 
-        prepared = await asyncio.gather(*(prepare(work) for work in selected), return_exceptions=True)
-        ready: list[tuple[dict, Path]] = []
-        for index, result in enumerate(prepared, 1):
-            if isinstance(result, tuple):
-                ready.append(result)
-            else:
-                logger.error(f"PixivNow 关键词随机第 {index} 张发送失败: {result}")
-        if ready:
-            yield self._artwork_collection_result(
-                event,
-                ready,
-                f"关键词随机 · {keyword} · {mode.upper()}",
+        优先使用配置 llm_tool_vision_provider 指定的提供商 ID；
+        留空时使用当前会话的聊天模型。若模型不支持图像输入或调用
+        失败，返回空字符串而不是中断整个工具执行。
+
+        Args:
+            event: 当前消息事件。
+            path: 图片临时文件路径。
+
+        Returns:
+            图片内容的自然语言描述；失败时返回空字符串。
+        """
+        try:
+            provider_id = str(
+                self._cfg("llm_tool_vision_provider", "") or ""
+            ).strip()
+            if not provider_id:
+                provider_id = await self.context.get_current_chat_provider_id(
+                    event.unified_msg_origin
+                )
+            prompt = str(
+                self._cfg(
+                    "llm_tool_vision_prompt",
+                    "请用中文描述这张 Pixiv 插画的画面内容，包括主体、构图、氛围、色彩等，200 字以内。",
+                )
+                or ""
+            ).strip()
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                image_urls=[str(path)],
             )
-        else:
-            yield event.plain_result("候选作品下载失败，请稍后重试。")
+            return (resp.completion_text or "").strip()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"PixivNow LLM 工具视觉描述生成失败: {e}")
+            return ""
+
+    async def _pixiv_keyword_random_tool_impl(
+        self, context: ContextWrapper[AstrAgentContext], keyword: str
+    ) -> str:
+        """LLM 工具 pixiv_keyword_random 的实际实现。
+
+        发送图片给用户，并根据 llm_tool_reply_mode 决定工具结果内容。
+
+        Args:
+            context: 当前 agent 运行上下文（含事件与插件 Context）。
+            keyword: 搜索关键词。
+
+        Returns:
+            回传给 LLM 的工具结果文本。
+        """
+        event = context.context.event
+        if not keyword:
+            return "错误：关键词不能为空。"
+        selected, error = await self._keyword_random_selection(keyword, 1, "safe")
+        if error or not selected:
+            return error or "没有找到相关插画。"
+        item = selected[0]
+        try:
+            item = await self._enrich_illust(item)
+            path = await self._download_best(item)
+        except PixivNowError as e:
+            return str(e)
+        try:
+            await self.context.send_message(
+                event.unified_msg_origin,
+                MessageChain().file_image(str(path)),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"PixivNow LLM 工具发送图片失败: {e}")
+            return f"图片发送失败：{e}"
+
+        mode = str(
+            self._cfg("llm_tool_reply_mode", "with_description") or "with_description"
+        )
+        if mode == "image_only":
+            return f"已向用户发送一张 Pixiv 插画（关键词：{keyword}），图片已发送完毕。"
+
+        parts = [f"已向用户发送一张 Pixiv 插画（关键词：{keyword}）。"]
+        description = await self._describe_image(event, path)
+        if description:
+            parts.append(f"图片内容：\n{description}")
+        return "\n\n".join(parts)
 
     @pixiv.command("rank", alias={"top"})
     async def pixiv_rank(

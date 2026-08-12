@@ -31,6 +31,12 @@
     "type": "int",
     "default": 1
   },
+  "keyword_random_pages": {
+    "description": "关键词随机抽取时汇总的搜索页数",
+    "type": "int",
+    "default": 3,
+    "hint": "会从前 N 页搜索结果中去重后随机抽取，范围会限制在 1-10 页。页数越大，随机候选越丰富，但请求耗时也会增加。"
+  },
   "r18_enabled": {
     "description": "是否允许使用 R18 模式（需配置 token 且 Pixiv 账号设置允许）",
     "type": "bool",

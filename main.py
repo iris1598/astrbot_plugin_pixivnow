@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 import re
 import tempfile
 from pathlib import Path
@@ -11,6 +12,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star
+from astrbot.core.star.filter.command import GreedyStr
 from .pixiv_grid_renderer import PixivGridRenderer
 
 UA = (
@@ -600,6 +602,8 @@ class PixivNowPlugin(Star):
         yield event.plain_result(
             "PixivNow 插件使用说明\n"
             "/pixiv random [n] [mode]  随机插画\n"
+            "/pixiv random_keyword <关键词> [n] [mode]  指定关键词随机插画\n"
+            "  别名：/pixiv krandom\n"
             "/pixiv rank [mode] [content] [p]  排行榜\n"
             "/pixiv search <关键词> [p] [mode]  搜索插画（结果为 3×3 拼图）\n"
             "  搜索后会话内：\n"
@@ -655,6 +659,86 @@ class PixivNowPlugin(Star):
             except PixivNowError as e:
                 logger.error(f"PixivNow random 图片发送失败: {e}")
                 yield event.plain_result(f"第 {idx} 张图片下载失败：{e}")
+
+    @pixiv.command("random_keyword", alias={"krandom"})
+    async def pixiv_random_keyword(
+        self,
+        event: AstrMessageEvent,
+        query: GreedyStr,
+    ):
+        """从指定关键词的搜索结果中随机抽取插画。
+
+        Args:
+            query(string): 关键词以及可选的数量、模式，例如 原神 风景 3 safe。
+        """
+        self._consume_event(event)
+        tokens = str(query).strip().split()
+        if not tokens:
+            yield event.plain_result(
+                "用法：/pixiv random_keyword <关键词> [数量] [mode]"
+            )
+            return
+
+        mode = str(self.config.get("default_mode", "safe") or "safe")
+        if tokens and tokens[-1].lower() in ("safe", "all", "r18"):
+            mode = tokens.pop().lower()
+
+        count = int(self.config.get("default_count", 1) or 1)
+        if tokens and tokens[-1].isdigit():
+            count = int(tokens.pop())
+        count = min(max(count, 1), 10)
+
+        keyword = " ".join(tokens).strip()
+        if not keyword:
+            yield event.plain_result("关键词不能为空。")
+            return
+        if not self._mode_allowed(mode):
+            yield event.plain_result("R18 模式未启用，或模式参数非法。")
+            return
+
+        page_count = min(
+            max(int(self.config.get("keyword_random_pages", 3) or 3), 1),
+            10,
+        )
+        results = await asyncio.gather(
+            *(self._do_search(keyword, page, mode) for page in range(1, page_count + 1)),
+            return_exceptions=True,
+        )
+        works: list[dict] = []
+        seen: set[str] = set()
+        last_error: PixivNowError | None = None
+        for result in results:
+            if isinstance(result, PixivNowError):
+                last_error = result
+                continue
+            if isinstance(result, Exception):
+                logger.warning(f"关键词随机搜索部分页面失败: {result}")
+                continue
+            for work in result:
+                work_id = str(work.get("id") or "")
+                if work_id and work_id not in seen:
+                    seen.add(work_id)
+                    works.append(work)
+
+        if not works:
+            if last_error:
+                yield event.plain_result(str(last_error))
+            else:
+                yield event.plain_result(f"没有搜索到与「{keyword}」相关的插画。")
+            return
+
+        selected = random.sample(works, min(count, len(works)))
+        for index, work in enumerate(selected, 1):
+            try:
+                detail = self._unwrap(
+                    await self._request(f"/ajax/illust/{work['id']}?full=1")
+                )
+                item = detail if isinstance(detail, dict) else work
+                img = await self._download_best(item)
+                yield event.chain_result(self._caption_chain(item, img))
+            except PixivNowError as e:
+                logger.error(f"PixivNow 关键词随机第 {index} 张发送失败: {e}")
+                yield event.plain_result(f"第 {index} 张图片下载失败：{e}")
 
     @pixiv.command("rank")
     async def pixiv_rank(

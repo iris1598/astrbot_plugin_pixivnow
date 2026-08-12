@@ -1213,13 +1213,14 @@ class PixivNowPlugin(Star):
             )
             return
         work = works[idx]
-        session["ts"] = asyncio.get_event_loop().time()
         try:
             item = await self._enrich_illust(work)
             img = await self._download_best(item)
             yield self._search_selection_result(event, item, img)
         except PixivNowError as e:
             yield event.plain_result(f"下载失败：{e}")
+        finally:
+            self._search_sessions.pop(umo, None)
 
     @pixiv.command("illust", alias={"i"})
     async def pixiv_illust(self, event: AstrMessageEvent, id: str):

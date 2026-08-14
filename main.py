@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import copy
 import hashlib
 import os
@@ -45,6 +46,15 @@ ONE_BOT_SEND_ACTIONS = (
     "send_private_msg",
     "send_group_forward_msg",
     "send_private_forward_msg",
+    "send_msg",
+)
+
+# 自动撤回的捕获上下文标记：仅在 _send_with_recall 的补丁窗口内、
+# 由发起发送的同一个任务设置。其他任务（如其他会话的 LLM 回复、
+# 其他插件主动发送）并发调用 bot.call_action 时，该标记不匹配，
+# 消息只会透传而不会被误捕获、误撤回。
+_recall_capture_token: contextvars.ContextVar = contextvars.ContextVar(
+    "pixivnow_recall_capture_token", default=None
 )
 
 # 回复作品时可通过配置勾选展示的信息字段（key -> 中文名，用于提示）
@@ -111,6 +121,8 @@ class PixivNowPlugin(Star):
         self._temp_files: list[Path] = []
         # 搜索会话：{会话id: {"works": [...], "created": timestamp}}
         self._search_sessions: dict[str, dict] = {}
+        # 自动撤回的每 bot 发送锁：{id(bot): asyncio.Lock}，串行化补丁窗口
+        self._recall_locks: dict[int, asyncio.Lock] = {}
         self._http_client: httpx.AsyncClient | None = None
         self._request_cache: dict[str, tuple[float, dict | list]] = {}
         self._byte_cache: dict[str, tuple[float, bytes]] = {}
@@ -219,6 +231,16 @@ class PixivNowPlugin(Star):
     ):
         """执行一次消息发送，并在开启自动撤回时捕获 OneBot 消息 ID 延迟撤回。
 
+        捕获通过临时替换共享 OneBot 客户端的 call_action 实现，因此必须
+        同时满足两个约束，避免把机器人发出的其他消息（其他插件的回复、
+        LLM 回复、唤醒提示等）一并误捕获、误撤回：
+
+        1. 每个 bot 一把锁，串行化补丁窗口。否则两个发送互相覆盖后，
+           外层 finally 可能把内层包装函数残留到共享客户端上，之后所有
+           消息都会被捕获并撤回；
+        2. 用 contextvars 标记区分“本任务正在发送”与“其他任务并发发送”。
+           补丁窗口内其他任务的消息只透传、不捕获。
+
         Args:
             send_func: 执行发送的异步可调用对象（如 context.send_message、event.send）。
             *args, **kwargs: 透传给 send_func 的参数。
@@ -234,23 +256,33 @@ class PixivNowPlugin(Star):
         if bot is None:
             return await send_func(*args, **kwargs)
 
-        captured: list = []
-        orig_call = bot.call_action
+        lock = self._recall_locks.setdefault(id(bot), asyncio.Lock())
+        async with lock:
+            captured: list = []
+            token = object()
+            orig_call = bot.call_action
 
-        async def wrapped_call(action, **params):
-            result = await orig_call(action, **params)
-            if action in ONE_BOT_SEND_ACTIONS:
-                if isinstance(result, dict) and result.get("message_id"):
+            async def wrapped_call(action, **params):
+                result = await orig_call(action, **params)
+                if (
+                    action in ONE_BOT_SEND_ACTIONS
+                    and _recall_capture_token.get() is token
+                    and isinstance(result, dict)
+                    and result.get("message_id")
+                ):
                     captured.append(result["message_id"])
-            return result
+                return result
 
-        bot.call_action = wrapped_call
-        try:
-            result = await send_func(*args, **kwargs)
-        finally:
-            bot.call_action = orig_call
-        self._schedule_recall(bot, captured)
-        return result
+            bot.call_action = wrapped_call
+            prev_token = _recall_capture_token.set(token)
+            try:
+                result = await send_func(*args, **kwargs)
+            finally:
+                _recall_capture_token.reset(prev_token)
+                bot.call_action = orig_call
+            # 快照去重后再调度，撤回任务只处理本次发送捕获到的消息 ID
+            self._schedule_recall(bot, list(dict.fromkeys(captured)))
+            return result
 
     def _attach_recall(self, event: AstrMessageEvent) -> None:
         """包装 event.send，使被动回复在发送后自动撤回（仅 OneBot v11）。"""

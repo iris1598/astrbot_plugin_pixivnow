@@ -2,7 +2,7 @@
 
 > 通过自托管的 [PixivNow](https://github.com/features-pixiv/pixiv-now) 服务访问 Pixiv，为 AstrBot 提供随机插画、排行榜、关键词搜索、画作/画师/小说详情等功能。图片统一经 PixivNow 代理下载，绕开 Pixiv 官方的 403 与反爬限制。
 
-版本：`2.2.0`  ·  兼容 AstrBot：`>=4.9.2`  ·  依赖：`httpx>=0.24`、`Pillow>=9.0`
+版本：`2.2.1`  ·  兼容 AstrBot：`>=4.9.2`  ·  依赖：`httpx>=0.24`、`Pillow>=9.0`
 
 ---
 

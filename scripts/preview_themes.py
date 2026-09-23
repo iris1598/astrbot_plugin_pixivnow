@@ -4,12 +4,25 @@ from __future__ import annotations
 
 import io
 import sys
+import types
 from pathlib import Path
 
 from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# 渲染器按审核要求从 astrbot.api 取日志器；独立运行时用最小日志桩顶替。
+if "astrbot" not in sys.modules:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from dev_logger import StubLogger
+
+    astrbot = types.ModuleType("astrbot")
+    api = types.ModuleType("astrbot.api")
+    api.logger = StubLogger("themes", level="WARNING")
+    astrbot.api = api
+    sys.modules["astrbot"] = astrbot
+    sys.modules["astrbot.api"] = api
 
 from pixiv_grid_renderer import PixivGridRenderer  # noqa: E402
 

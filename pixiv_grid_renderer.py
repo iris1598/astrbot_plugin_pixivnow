@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import io
-import logging
 import math
 import subprocess
 import sys
@@ -16,9 +15,9 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
+from astrbot.api import logger
 
 ACCENT = (0, 150, 250)
-logger = logging.getLogger(__name__)
 
 _FONT_CANDIDATES = {
     "win32": (
@@ -78,7 +77,7 @@ def _discover_fonts(custom_path: str | None = None) -> tuple[str | None, str | N
                 bold = next((p for p in found if "bold" in p.name.lower()), found[0])
                 regular = next((p for p in found if "regular" in p.name.lower()), found[0])
                 return str(regular), str(bold)
-        logger.warning("PixivNow 渲染字体路径无效，将自动探测系统字体: %s", custom_path)
+        logger.warning(f"PixivNow 渲染字体路径无效，将自动探测系统字体: {custom_path}")
 
     platform = sys.platform if sys.platform in _FONT_CANDIDATES else "linux"
     for regular_name, bold_name in _FONT_CANDIDATES[platform]:

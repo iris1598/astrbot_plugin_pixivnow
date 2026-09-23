@@ -736,7 +736,8 @@ class PixivNowPlugin(Star):
         }[kind]
         canvas = await asyncio.to_thread(render_method, data, media)
         result = self._save_canvas(canvas)
-        self._cache_put(self._render_cache, render_key, result, self._cache_ttl("render"))
+        ttl = max(self._cache_ttl("render"), 120)
+        self._cache_put(self._render_cache, render_key, result, ttl)
         self._prune_cache(self._render_cache, 32)
         return result
 

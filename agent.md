@@ -22,7 +22,7 @@ AstrBot 插件：把聊天指令转发给**自托管的 PixivNow 服务**（本�
 | 上游 | PixivNow 服务：[features-pixiv/pixiv-now](https://github.com/features-pixiv/pixiv-now)；卡片视觉语言参考 [astrbot_plugin_rika_share](https://github.com/iris1598/astrbot_plugin_rika_share) |
 | 依赖 | `httpx>=0.24`、`Pillow>=9.0`（见 `requirements.txt`） |
 
-> 已知偏差：无。（`metadata.yaml` 与 `README.md` 的版本号当前都是 `2.2.1`，改动版本时记得两处一起改。）
+> 已知偏差：无。（`metadata.yaml` 与 `README.md` 的版本号当前都是 `2.2.2`，改动版本时记得两处一起改。）
 
 ---
 
